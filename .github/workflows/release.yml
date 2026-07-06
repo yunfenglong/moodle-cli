@@ -1,4 +1,4 @@
-name: Publish GitHub Release
+name: Release
 
 on:
   push:
@@ -12,43 +12,76 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
-  release:
+  publish:
     needs: verify
     runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/moodle-cli
     permissions:
       contents: write
+      id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Node
+        uses: actions/setup-node@v5
         with:
-          python-version: "3.12"
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Verify tag matches package version
         run: |
-          python - <<'PY'
-          import os
-          import pathlib
-          import tomllib
+          node - <<'JS'
+          const fs = require("node:fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const tag = process.env.GITHUB_REF_NAME;
+          const expected = `v${pkg.version}`;
+          if (pkg.name !== "moodle-cli") {
+            throw new Error(`Refusing to release unexpected package name: ${pkg.name}`);
+          }
+          if (tag !== expected) {
+            throw new Error(`Tag ${tag} does not match package version ${expected}`);
+          }
+          console.log(`Validated release tag ${tag} for ${pkg.name}`);
+          JS
 
-          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
-          name = project["name"]
-          version = project["version"]
-          tag = os.environ["GITHUB_REF_NAME"]
-          expected = f"v{version}"
-          if name != "moodle-cli":
-              raise SystemExit(f"Refusing to release unexpected package name: {name}")
-          if tag != expected:
-              raise SystemExit(f"Tag {tag} does not match package version {expected}")
-          print(f"Validated release tag {tag} for {name}")
-          PY
+      - name: Typecheck
+        run: npm run check
 
-      - name: Build package
-        run: uv build
+      - name: Test
+        run: npm test
+
+      - name: Bundle npm package
+        run: npm run build
+
+      - name: Check SKILL.md drift
+        run: |
+          npm run skill:generate
+          git diff --exit-code SKILL.md
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Build standalone binaries
+        run: |
+          mkdir -p dist/bin
+          bun build ./src/cli.ts --compile --target=bun-darwin-arm64 --outfile dist/bin/moodle-darwin-arm64
+          bun build ./src/cli.ts --compile --target=bun-linux-x64 --outfile dist/bin/moodle-linux-x64
+          chmod +x dist/bin/moodle-*
 
       - name: Resolve release notes file
         id: notes
@@ -68,8 +101,8 @@ jobs:
         with:
           body_path: ${{ steps.notes.outputs.notes_file }}
           files: |
-            dist/*.tar.gz
-            dist/*.whl
+            dist/bin/moodle-darwin-arm64
+            dist/bin/moodle-linux-x64
 
       - name: Publish GitHub release with generated notes
         if: steps.notes.outputs.has_manual_notes != 'true'
@@ -77,5 +110,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/*.tar.gz
-            dist/*.whl
+            dist/bin/moodle-darwin-arm64
+            dist/bin/moodle-linux-x64

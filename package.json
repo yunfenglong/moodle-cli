@@ -1,0 +1,50 @@
+{
+  "name": "moodle-cli",
+  "version": "0.4.2",
+  "description": "Terminal-first CLI for Moodle LMS",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "moodle": "dist/moodle.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "SKILL.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "skill:generate": "node dist/moodle.js skills generate",
+    "prepublishOnly": "npm run check && npm run test && npm run build"
+  },
+  "dependencies": {
+    "commander": "^14.0.0",
+    "node-html-parser": "^7.0.1",
+    "yaml": "^2.8.0",
+    "zod": "^4.0.5"
+  },
+  "optionalDependencies": {
+    "chrome-cookies-secure": "^3.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.10",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bunizao/moodle-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bunizao/moodle-cli/issues"
+  },
+  "homepage": "https://github.com/bunizao/moodle-cli#readme"
+}

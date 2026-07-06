@@ -1,61 +1,61 @@
 # moodle-cli
 
-Terminal-first CLI for Moodle LMS that reuses an authenticated browser session.
+Terminal-first CLI for Moodle LMS that reuses an authenticated browser session. No Moodle API token required.
 
 ## Features
 
-- No API token setup required
 - Reuses `MoodleSession` from `okta-auth`, your browser, or `MOODLE_SESSION`
-- Works with Moodle AJAX APIs and falls back to authenticated page scraping when needed
-- Upcoming timeline items for student-facing deadlines and actions
-- Terminal output plus `--json` and `--yaml`
-
-## Requirements
-
-- Python 3.10+
-- `uv`
-- One of:
-  - `okta-auth-cli` configured for your Moodle site
-  - An active Moodle browser session
-  - A `MOODLE_SESSION` environment variable
+- Uses Moodle AJAX APIs and falls back to authenticated page scraping when needed
+- Lists courses, deadlines, alerts, activities, grades, and forum discussions
+- Agent-friendly JSON/YAML output, field selection, and stable exit codes
 
 ## Install
 
 ```bash
-# Recommended: uv tool
-uv tool install moodle-cli
+npm i -g moodle-cli
+```
 
-# Optional: automatic Okta login and session reuse
-uv tool install okta-auth-cli
+Run without installing:
+
+```bash
+npx moodle-cli --help
+```
+
+Standalone binaries are attached to GitHub Releases for macOS arm64 and Linux x64.
+
+### Existing PyPI Users
+
+The TypeScript CLI keeps the same config file and environment variables as the Python package. Migrate with:
+
+```bash
+uv tool uninstall moodle-cli
+npm i -g moodle-cli
+```
+
+`~/.config/moodle-cli/config.yaml`, `MOODLE_BASE_URL`, and `MOODLE_SESSION` remain compatible.
+
+## Authentication
+
+Use one of:
+
+- `okta-auth-cli` configured for your Moodle site
+- an active Moodle browser session
+- a `MOODLE_SESSION` environment variable
+
+Optional Okta setup:
+
+```bash
+npm i -g okta-auth-cli
 okta config
-
-# Alternative: pipx
-pipx install moodle-cli
 ```
 
-## Agent Skill
+On first run, if no `base_url` is configured, the CLI prompts for the Moodle root URL and saves it to `~/.config/moodle-cli/config.yaml`:
 
-Install the agent skill with the shared `skills` CLI spec:
-
-```bash
-npx skills add https://github.com/bunizao/moodle-cli
+```yaml
+base_url: https://school.example.edu
 ```
 
-If you already installed `moodle`, the CLI exposes the same thing as a thin alias:
-
-```bash
-moodle skills add
-```
-
-If `npx` is not available, the alias falls back to `npm exec`.
-
-Install from source:
-
-```bash
-git clone https://github.com/bunizao/moodle-cli.git
-cd moodle-cli
-uv sync
-```
+Use a root URL only, not `/login/index.php` or `/my/`.
 
 ## Usage
 
@@ -71,55 +71,85 @@ moodle activities 34637
 moodle https://school.example.edu/course/view.php?id=34637
 moodle https://school.example.edu/mod/forum/discuss.php?d=9001#p9101 --json
 moodle skills
+moodle skills generate
 moodle skills add
 moodle update
 moodle update --check-only
 ```
 
-You can also paste supported Moodle page URLs directly as the first argument. The CLI routes forum discussion, forum view, assignment, quiz, resource, link, page, folder, course, and grade report URLs to the shortest matching command.
+Supported Moodle URLs can be passed as the first argument. The CLI routes forum discussion, forum view, assignment, quiz, resource, link, page, folder, course, and grade report URLs to the shortest matching command.
 
-To check without applying an upgrade:
+## Agent Output Contract
+
+JSON-capable commands support:
+
+- `--json`: write JSON to stdout
+- `--yaml`: write YAML to stdout
+- `--table`: force human output
+- `--fields a,b,c`: keep only listed top-level fields; arrays apply the filter per item
+
+When stdout is not a TTY, the CLI defaults to JSON. `--table` overrides that.
+
+Invalid `--fields` values fail as usage errors and list valid fields.
+
+With JSON output enabled, errors are one parseable JSON line on stderr:
+
+```json
+{"error":true,"code":"auth_failed","message":"...","hint":"..."}
+```
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Unexpected error |
+| 2 | Authentication or configuration error |
+| 3 | Usage error |
+| 4 | Requested course, activity, forum, or discussion was not found |
+
+## Updates
 
 ```bash
 moodle update --check-only
+moodle update --json
 ```
 
-`moodle update` now tries to upgrade directly with `uv tool upgrade moodle-cli` and falls back to `pipx upgrade moodle-cli` when needed.
-
-To upgrade manually after an update is available:
+`moodle update` checks `https://registry.npmjs.org/moodle-cli/latest`. npm installs update with:
 
 ```bash
-uv tool upgrade moodle-cli
-# or
-pipx upgrade moodle-cli
+npm install -g moodle-cli@latest
 ```
 
-## Configuration
+Standalone binaries print the latest GitHub Release URL instead of modifying themselves.
 
-On first run, if no `base_url` is configured, the CLI will prompt you and write it to `config.yaml` in the project directory or in `~/.config/moodle-cli/`:
+## Agent Skill
 
-```yaml
-base_url: https://school.example.edu
+Install the bundled agent skill:
+
+```bash
+npx skills add https://github.com/bunizao/moodle-cli
 ```
 
-Required format:
+The CLI alias delegates to the same command:
 
-- Use a full root URL such as `https://school.example.edu`
-- Do not include paths, query strings, or fragments
-- Do not use URLs like `/login/index.php` or `/my/`
-- The CLI validates the URL against Moodle's token endpoint and asks again if it does not look valid
+```bash
+moodle skills add
+```
 
-You can also set `MOODLE_BASE_URL` instead of using the interactive prompt.
-You can copy from `config.example.yaml`.
+Regenerate `SKILL.md` from the command tree:
 
-Environment overrides:
-
-- `MOODLE_BASE_URL`
-- `MOODLE_SESSION`
+```bash
+npm run build
+npm run skill:generate
+git diff --exit-code SKILL.md
+```
 
 ## Development
 
 ```bash
-uv run python -m compileall moodle_cli
-uv build
+npm install
+npm run check
+npm test
+npm run build
 ```

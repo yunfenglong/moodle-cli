@@ -10,55 +10,67 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test (Python ${{ matrix.python-version }})
+  node:
+    name: Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        node-version: [20, 22]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Node
+        uses: actions/setup-node@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          node-version: ${{ matrix.node-version }}
+          cache: npm
 
-      - name: Sync dependencies
-        run: uv sync --locked
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Run tests
-        run: uv run pytest -q
+      - name: Typecheck
+        run: npm run check
 
-      - name: Compile package
-        run: uv run python -m compileall moodle_cli
+      - name: Test
+        run: npm test
 
-      - name: Smoke test CLI
-        run: uv run moodle --help
+      - name: Build
+        run: npm run build
 
-  build:
-    name: Build distribution
+      - name: Check SKILL.md drift
+        run: |
+          npm run skill:generate
+          git diff --exit-code SKILL.md
+
+  bun:
+    name: Bun latest
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          python-version: "3.12"
+          bun-version: latest
 
-      - name: Build package
-        run: uv build
+      - name: Install dependencies
+        run: bun install
 
-      - name: Check distribution metadata
-        run: uvx twine check dist/*
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Test
+        run: bunx vitest run
+
+      - name: Build
+        run: bunx tsup
+
+      - name: Check SKILL.md drift
+        run: |
+          bun run skill:generate
+          git diff --exit-code SKILL.md

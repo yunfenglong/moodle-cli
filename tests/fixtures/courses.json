@@ -1,0 +1,20 @@
+[
+  {
+    "id": 101,
+    "shortname": "MATH101",
+    "fullname": "Mathematics 101",
+    "category": 4,
+    "visible": true,
+    "startdate": 1700000000,
+    "enddate": 0
+  },
+  {
+    "id": 202,
+    "shortname": "MATH102",
+    "fullname": "Mathematics 102",
+    "category": 4,
+    "visible": false,
+    "startdate": 1700000100,
+    "enddate": 0
+  }
+]

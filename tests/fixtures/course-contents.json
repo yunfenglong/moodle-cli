@@ -1,0 +1,27 @@
+[
+  {
+    "id": 11,
+    "name": "Introduction",
+    "section": 1,
+    "visible": true,
+    "summary": "Start here",
+    "modules": [
+      {
+        "id": 21,
+        "name": "Syllabus",
+        "modname": "resource",
+        "url": "https://school.example.edu/mod/resource/view.php?id=21",
+        "visible": true,
+        "description": "Read first"
+      },
+      {
+        "id": 22,
+        "name": "Quiz 1",
+        "modname": "quiz",
+        "url": "https://school.example.edu/mod/quiz/view.php?id=22",
+        "visible": false,
+        "description": ""
+      }
+    ]
+  }
+]
