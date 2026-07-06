@@ -25,7 +25,7 @@ import {
   URL_VIEW_PATH,
 } from "./constants.js";
 import { getAuthenticatedSession, type AuthOptions, type AuthenticatedSession, type MoodleSessionCookie } from "./auth.js";
-import { MoodleAPIError, NotFoundError } from "./errors.js";
+import { isLoginRequiredError, MoodleAPIError, NotFoundError } from "./errors.js";
 import type {
   AlertSummary,
   Assignment,
@@ -150,7 +150,7 @@ export class MoodleClient {
     this.sesskey = typeof data.sesskey === "string" ? data.sesskey : this.sesskey;
     this.userid = info.userid;
     this.userInfo = info;
-    this.writeCache();
+    await this.writeCache();
     return info;
   }
 
@@ -579,7 +579,7 @@ export class MoodleClient {
     }
     const body = await response.json();
     const envelope = AjaxEnvelopeSchema.parse(body);
-    return envelope.map((item) => {
+    const results: AjaxBatchResult[] = envelope.map((item) => {
       if (item.error) {
         return {
           ok: false,
@@ -588,6 +588,16 @@ export class MoodleClient {
       }
       return { ok: true, data: item.data ?? item };
     });
+    if (
+      allowRetry &&
+      !this.retryingLogin &&
+      this.onLoginRequired &&
+      results.some((result) => !result.ok && isLoginRequiredError(result.error))
+    ) {
+      await this.reauthenticate();
+      return this.callBatchInternal(requests, false);
+    }
+    return results;
   }
 
   private async ensureSession(): Promise<void> {
@@ -597,7 +607,7 @@ export class MoodleClient {
     const html = await this.get(DASHBOARD_PATH);
     const context = parsePageContext(html, this.baseUrl);
     this.applyContext(context);
-    this.writeCache();
+    await this.writeCache();
   }
 
   private async get(pathname: string, params: Record<string, string | number> = {}): Promise<string> {
@@ -667,7 +677,7 @@ export class MoodleClient {
       const auth = await this.onLoginRequired();
       this.cookie = auth.cookie;
       this.applyContext(auth.pageContext);
-      this.writeCache();
+      await this.writeCache();
     } finally {
       this.retryingLogin = false;
     }
@@ -679,9 +689,13 @@ export class MoodleClient {
     this.userInfo = context.user_info;
   }
 
-  private writeCache(): void {
+  private async writeCache(): Promise<void> {
     if (this.cacheOptions && this.sesskey && this.userid) {
-      void writeCachedSession({ baseUrl: this.baseUrl, cookieName: this.cookie.name, cookieValue: this.cookie.value, sesskey: this.sesskey, userid: this.userid, savedAt: Date.now() }, this.cacheOptions);
+      try {
+        await writeCachedSession({ baseUrl: this.baseUrl, cookieName: this.cookie.name, cookieValue: this.cookie.value, sesskey: this.sesskey, userid: this.userid, savedAt: (this.cacheOptions.now ?? Date.now)() }, this.cacheOptions);
+      } catch {
+        return;
+      }
     }
   }
 }

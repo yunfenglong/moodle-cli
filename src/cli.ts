@@ -33,6 +33,7 @@ interface CliIO {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   homeDir?: string;
+  rootArgs?: string[];
 }
 
 interface Runtime {
@@ -56,6 +57,8 @@ export function buildProgram(io: CliIO = {}): Command {
   program.version(VERSION);
   program.description("Terminal-first CLI for Moodle LMS.");
   program.exitOverride();
+  program.allowUnknownOption(true);
+  program.allowExcessArguments(true);
   program.configureOutput({
     writeOut: (text) => stdout.write(text),
     writeErr: (text) => stderr.write(text),
@@ -97,7 +100,7 @@ export function buildProgram(io: CliIO = {}): Command {
     if (!looksLikeUrl(target)) {
       throw new UsageError(`No such command '${target}'.`);
     }
-    await dispatchUrl(runtime, target, {});
+    await dispatchUrl(runtime, target, { ...parseRootOutputOptions(io.rootArgs ?? []), ...options });
   });
 
   addOutputOptions(program.command("user").description("Show authenticated user info.")).action(async (options: OutputCommandOptions) => {
@@ -135,7 +138,7 @@ export function buildProgram(io: CliIO = {}): Command {
     });
 
   addCourseCommand(program, runtime, "course", "Show course detail with sections.", async (client, courseId) => client.getCourseContents(courseId), formatCourseSections);
-  addCourseCommand(program, runtime, "activities", "List activities in a course.", async (client, courseId) => client.getCourseContents(courseId), formatActivityList);
+  addCourseCommand(program, runtime, "activities", "List activities in a course.", async (client, courseId) => client.getActivities(courseId), formatActivityList);
 
   addOutputOptions(program.command("grades").description("Show grade details for a course.").argument("<course>", "Course ID or unique name")).action(
     async (course: string, options: OutputCommandOptions) => {
@@ -259,9 +262,9 @@ export function buildProgram(io: CliIO = {}): Command {
 }
 
 export async function runCli(argv = process.argv, io: CliIO = {}): Promise<number> {
-  const program = buildProgram(io);
   const stderr = io.stderr ?? process.stderr;
   const stdout = io.stdout ?? process.stdout;
+  const program = buildProgram({ ...io, rootArgs: argv.slice(2) });
   try {
     await program.parseAsync(argv, { from: "node" });
     return 0;
@@ -490,6 +493,21 @@ function writeError(error: CliError, stderr: CliIO["stderr"], asJson: boolean): 
 
 function wantsJsonFromArgs(argv: string[], stdout: CliIO["stdout"]): boolean {
   return argv.includes("--json") || (!argv.includes("--table") && !("isTTY" in (stdout as NodeJS.WriteStream) && (stdout as NodeJS.WriteStream).isTTY));
+}
+
+function parseRootOutputOptions(args: string[]): OutputCommandOptions {
+  const fieldsIndex = args.findIndex((arg) => arg === "--fields" || arg.startsWith("--fields="));
+  const fieldsArg = fieldsIndex >= 0 ? args[fieldsIndex] : "";
+  const fields = fieldsArg.startsWith("--fields=") ? fieldsArg.slice("--fields=".length) : fieldsIndex >= 0 ? args[fieldsIndex + 1] : undefined;
+  if (fieldsIndex >= 0 && (!fields || fields.startsWith("--"))) {
+    throw new UsageError("--fields requires a value.");
+  }
+  return {
+    json: args.includes("--json"),
+    yaml: args.includes("--yaml"),
+    table: args.includes("--table"),
+    fields,
+  };
 }
 
 function labelFor(error: CliError): string {

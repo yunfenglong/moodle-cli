@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { runCli } from "../src/cli";
 import { MoodleAPIError, MoodleClient, type AjaxCall } from "../src/client";
+import { ENV_MOODLE_BASE_URL, ENV_MOODLE_SESSION } from "../src/constants";
 import { resolveCourseReference, parseActivityReference, resolveTopLevelUrl } from "../src/url-resolver";
 
 const BASE_URL = "https://school.example.edu";
@@ -295,4 +300,239 @@ describe("MoodleClient course/activity modules", () => {
       /Unsupported Moodle URL/,
     );
   });
+
+  it("prints CLI JSON parity for courses, course sections, and flat activities", async () => {
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      ajaxRoute("core_enrol_get_users_courses", jsonFixture("courses.json")),
+      ajaxRoute("core_course_get_contents", jsonFixture("course-contents.json")),
+    ]);
+
+    const courses = await runJsonCommand(["courses", "--json", "--fields", "id,shortname"], fetchImpl);
+    expect(courses.code).toBe(0);
+    expect(JSON.parse(courses.stdout)).toEqual([
+      { id: 101, shortname: "MATH101" },
+      { id: 202, shortname: "MATH102" },
+    ]);
+
+    const course = await runJsonCommand(["course", "101", "--json"], fetchImpl);
+    expect(course.code).toBe(0);
+    const courseJson = JSON.parse(course.stdout);
+    expect(courseJson[0].id).toBe(11);
+    expect(courseJson[0].name).toBe("Introduction");
+    expect(courseJson[0].activities[0]).toMatchObject({ id: 21, name: "Syllabus" });
+
+    const activities = await runJsonCommand(["activities", "101", "--json"], fetchImpl);
+    expect(activities.code).toBe(0);
+    expect(JSON.parse(activities.stdout)).toEqual([
+      { id: 21, name: "Syllabus", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=21`, visible: true, description: "Read first" },
+      { id: 22, name: "Quiz 1", modname: "quiz", url: `${BASE_URL}/mod/quiz/view.php?id=22`, visible: false },
+    ]);
+  });
+
+  it("prints CLI JSON parity for todo, alerts, and overview", async () => {
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      (request) => {
+        if (request.init?.method !== "POST") {
+          return undefined;
+        }
+        const body = JSON.parse(String(request.init.body)) as AjaxCall[];
+        const methods = body.map((call) => call.methodname);
+        if (methods.length === 1 && methods[0] === "core_calendar_get_action_events_by_timesort") {
+          return jsonResponse([{ index: 0, error: false, data: todoPayload() }]);
+        }
+        if (methods.join(",") === "message_popup_get_popup_notifications,core_message_get_conversation_counts,core_message_get_unread_conversation_counts") {
+          return jsonResponse(alertBatch());
+        }
+        if (methods.join(",") === "core_enrol_get_users_courses,core_calendar_get_action_events_by_timesort,message_popup_get_popup_notifications,core_message_get_conversation_counts,core_message_get_unread_conversation_counts") {
+          return jsonResponse([{ index: 0, error: false, data: jsonFixture("courses.json") }, { index: 1, error: false, data: todoPayload() }, ...alertBatch().map((item, index) => ({ ...item, index: index + 2 }))]);
+        }
+        return undefined;
+      },
+    ]);
+
+    const todo = await runJsonCommand(["todo", "--limit", "5", "--json", "--fields", "id,name"], fetchImpl);
+    expect(todo.code).toBe(0);
+    expect(JSON.parse(todo.stdout)).toEqual([{ id: 301, name: "Quiz 1 is due" }]);
+
+    const alerts = await runJsonCommand(["alerts", "--json"], fetchImpl);
+    expect(alerts.code).toBe(0);
+    expect(JSON.parse(alerts.stdout)).toMatchObject({ notification_count: 1, direct_message_count: 2, unread_direct_message_count: 1 });
+
+    const overview = await runJsonCommand(["overview", "--json"], fetchImpl);
+    expect(overview.code).toBe(0);
+    const overviewJson = JSON.parse(overview.stdout);
+    expect(overviewJson.user.userid).toBe(7);
+    expect(overviewJson.courses[0].id).toBe(101);
+    expect(overviewJson.todo[0].id).toBe(301);
+    expect(overviewJson.alerts.notification_count).toBe(1);
+  });
+
+  it("routes top-level URLs with structured output options", async () => {
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      (request) => (request.url === `${BASE_URL}/mod/assign/view.php?id=31` ? htmlResponse(fixture("assign.html")) : undefined),
+    ]);
+
+    const result = await runJsonCommand([`${BASE_URL}/mod/assign/view.php?id=31`, "--json", "--fields", "id,name"], fetchImpl);
+
+    expect(result).toMatchObject({ code: 0, stderr: "" });
+    expect(JSON.parse(result.stdout)).toEqual({ id: 31, name: "Essay 1" });
+  });
+
+  it("returns usage errors for invalid URL --fields", async () => {
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      (request) => (request.url === `${BASE_URL}/mod/assign/view.php?id=31` ? htmlResponse(fixture("assign.html")) : undefined),
+    ]);
+
+    const invalid = await runJsonCommand([`${BASE_URL}/mod/assign/view.php?id=31`, "--json", "--fields", "missing"], fetchImpl);
+    expect(invalid.code).toBe(3);
+    expect(JSON.parse(invalid.stderr)).toMatchObject({ code: "usage_error" });
+    expect(invalid.stderr).toContain("Valid fields");
+
+    const missing = await runJsonCommand([`${BASE_URL}/mod/assign/view.php?id=31`, "--json", "--fields"], fetchImpl);
+    expect(missing.code).toBe(3);
+    expect(JSON.parse(missing.stderr)).toMatchObject({ code: "usage_error", message: "--fields requires a value." });
+  });
+
+  it("applies --fields to forum find", async () => {
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      ajaxRoute("core_enrol_get_users_courses", jsonFixture("courses.json")),
+      ajaxRoute("core_course_get_contents", []),
+      (request) => {
+        if (request.init?.method !== "POST" || !request.url.includes("mod_forum_get_discussion_posts")) {
+          return undefined;
+        }
+        const body = JSON.parse(String(request.init.body)) as AjaxCall[];
+        const discussionId = Number(body[0]?.args?.discussionid ?? 0);
+        return jsonResponse([{
+          index: 0,
+          error: false,
+          data: {
+            courseid: 101,
+            forumid: 501,
+            posts: [{
+              id: discussionId + 100,
+              discussionid: discussionId,
+              subject: discussionId === 9001 ? "Exam deadline questions" : "Lecture recap",
+              message: "",
+              author: { id: 12, fullname: "Alice Example", urls: { profile: `${BASE_URL}/user/view.php?id=12` } },
+              timecreated: discussionId === 9001 ? 200 : 100,
+              unread: false,
+              urls: { view: `${BASE_URL}/mod/forum/discuss.php?d=${discussionId}#p${discussionId + 100}` },
+            }],
+          },
+        }]);
+      },
+      (request) => {
+        if (request.url === `${BASE_URL}/mod/forum/view.php?id=501`) return htmlResponse(fixture("forum-view-default-grouped.html"));
+        if (request.url === `${BASE_URL}/mod/forum/view.php?id=501&group=10`) return htmlResponse(fixture("forum-view-group-a.html"));
+        if (request.url === `${BASE_URL}/mod/forum/view.php?id=501&group=20`) return htmlResponse(fixture("forum-view-group-b.html"));
+        return undefined;
+      },
+    ]);
+
+    const result = await runJsonCommand([
+      "forum",
+      "find",
+      "deadline",
+      "--forum",
+      "501",
+      "--titles-only",
+      "--json",
+      "--fields",
+      "discussion_id,discussion_subject",
+    ], fetchImpl);
+
+    expect(result).toMatchObject({ code: 0, stderr: "" });
+    expect(JSON.parse(result.stdout)).toEqual({ discussion_id: 9001, discussion_subject: "Exam deadline questions" });
+  });
 });
+
+function cliFetch(routes: Array<(request: SeenRequest) => Response | undefined>): typeof fetch {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = { url: String(input), init };
+    for (const route of routes) {
+      const response = route(request);
+      if (response) {
+        return response;
+      }
+    }
+    throw new Error(`Unexpected fetch: ${request.url}`);
+  }) as typeof fetch;
+}
+
+async function runJsonCommand(args: string[], fetchImpl: typeof fetch): Promise<{ code: number; stdout: string; stderr: string }> {
+  const stdout = buffer();
+  const stderr = buffer();
+  const code = await runCli(["node", "moodle", ...args], {
+    env: { [ENV_MOODLE_BASE_URL]: BASE_URL, [ENV_MOODLE_SESSION]: "cookie" },
+    fetchImpl,
+    stdout,
+    stderr,
+    stdin: { isTTY: false } as NodeJS.ReadStream,
+    homeDir: await mkdtemp(join(tmpdir(), "moodle-cli-run-")),
+  });
+  return { code, stdout: stdout.text(), stderr: stderr.text() };
+}
+
+function buffer() {
+  let value = "";
+  return {
+    write(chunk: string) {
+      value += chunk;
+      return true;
+    },
+    text() {
+      return value;
+    },
+  };
+}
+
+function todoPayload() {
+  return {
+    events: [
+      {
+        id: 301,
+        name: "Quiz 1 is due",
+        activityname: "Quiz 1",
+        modulename: "quiz",
+        course: { id: 101, fullname: "Mathematics 101", progress: 42 },
+        timesort: 1760000000,
+        action: { actionable: true, name: "Attempt quiz", url: `${BASE_URL}/mod/quiz/view.php?id=22` },
+        url: `${BASE_URL}/mod/quiz/view.php?id=22`,
+        eventtype: "due",
+      },
+    ],
+  };
+}
+
+function alertBatch() {
+  return [
+    {
+      index: 0,
+      error: false,
+      data: {
+        notifications: [
+          {
+            id: 401,
+            subject: "Message subject",
+            shortenedsubject: "Message",
+            eventtype: "message",
+            component: "message",
+            timecreated: 1760000100,
+            timecreatedpretty: "Today",
+            read: false,
+            contexturl: `${BASE_URL}/message`,
+            contexturlname: "Messages",
+          },
+        ],
+      },
+    },
+    { index: 1, error: false, data: { favourites: 1, types: { "1": 2, "2": 0, "3": 0 } } },
+    { index: 2, error: false, data: { favourites: 0, types: { "1": 1, "2": 0, "3": 0 } } },
+  ];
+}
