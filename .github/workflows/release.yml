@@ -94,9 +94,13 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Use npm with trusted publishing support
+        if: steps.npm.outputs.published != 'true'
+        run: npm install -g npm@11.17.0
+
       - name: Publish to npm
         if: steps.npm.outputs.published != 'true'
-        run: npx --yes npm@latest publish --access public
+        run: npm publish --access public
 
       - name: Build standalone binaries
         run: |
