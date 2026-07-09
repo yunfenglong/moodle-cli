@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, for example v0.5.0"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -25,6 +31,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Set up Node
         uses: actions/setup-node@v5
@@ -42,11 +50,13 @@ jobs:
         run: npm ci
 
       - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           node - <<'JS'
           const fs = require("node:fs");
           const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const tag = process.env.GITHUB_REF_NAME;
+          const tag = process.env.RELEASE_TAG;
           const expected = `v${pkg.version}`;
           if (pkg.name !== "moodle-cli") {
             throw new Error(`Refusing to release unexpected package name: ${pkg.name}`);
@@ -71,10 +81,20 @@ jobs:
           npm run skill:generate
           git diff --exit-code SKILL.md
 
+      - name: Check npm publication state
+        id: npm
+        run: |
+          package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          if npm view "moodle-cli@${package_version}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "moodle-cli@${package_version} is already published; skipping npm publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm
+        if: steps.npm.outputs.published != 'true'
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Build standalone binaries
         run: |
@@ -85,8 +105,10 @@ jobs:
 
       - name: Resolve release notes file
         id: notes
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          version_tag="${GITHUB_REF_NAME#v}"
+          version_tag="${RELEASE_TAG#v}"
           notes_file=".github/release-notes/${version_tag}.md"
           if [ -f "${notes_file}" ]; then
             echo "has_manual_notes=true" >> "$GITHUB_OUTPUT"
@@ -99,6 +121,7 @@ jobs:
         if: steps.notes.outputs.has_manual_notes == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           body_path: ${{ steps.notes.outputs.notes_file }}
           files: |
             dist/bin/moodle-darwin-arm64
@@ -108,6 +131,7 @@ jobs:
         if: steps.notes.outputs.has_manual_notes != 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: |
             dist/bin/moodle-darwin-arm64
