@@ -96,7 +96,7 @@ jobs:
 
       - name: Publish to npm
         if: steps.npm.outputs.published != 'true'
-        run: npm publish --provenance --access public
+        run: npx --yes npm@latest publish --access public
 
       - name: Build standalone binaries
         run: |
