@@ -1,6 +1,6 @@
 {
   "name": "moodle-cli",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Terminal-first CLI for Moodle LMS",
   "license": "MIT",
   "type": "module",
@@ -17,6 +17,7 @@
     "build": "tsup && rm -f dist/.gitignore",
     "check": "tsc --noEmit",
     "pack:check": "npm pack --dry-run --json | node -e \"let data = ''; process.stdin.on('data', chunk => data += chunk); process.stdin.on('end', () => { const files = JSON.parse(data)[0]?.files?.map(file => file.path) ?? []; if (!files.includes('dist/moodle.js')) throw new Error('npm package is missing dist/moodle.js'); });\"",
+    "pack:smoke": "tmp=\"$(mktemp -d)\" && npm pack --pack-destination \"$tmp\" >/dev/null && npm install --prefix \"$tmp/install\" \"$tmp\"/moodle-cli-*.tgz >/dev/null && test \"$(\"$tmp/install/node_modules/.bin/moodle\" --version)\" = \"$(node -p \"JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version\")\"",
     "test": "vitest run",
     "test:watch": "vitest",
     "skill:generate": "node dist/moodle.js skills generate",

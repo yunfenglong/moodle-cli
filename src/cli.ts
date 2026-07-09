@@ -1,4 +1,5 @@
 import { Command, CommanderError } from "commander";
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createMoodleClient, filterDiscussionToPost, type MoodleClient } from "./client.js";
 import { loadConfig } from "./config.js";
@@ -532,7 +533,7 @@ function queryMatches(text: string, query: string): boolean {
   return needle ? haystack.includes(needle) || needle.split(" ").every((token) => haystack.includes(token)) : true;
 }
 
-const isMain = process.argv[1] ? fileURLToPath(import.meta.url) === process.argv[1] : false;
+const isMain = process.argv[1] ? realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]) : false;
 if (isMain) {
   runCli().then((code) => {
     process.exitCode = code;
