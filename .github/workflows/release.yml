@@ -76,6 +76,9 @@ jobs:
       - name: Bundle npm package
         run: npm run build
 
+      - name: Check npm package contents
+        run: npm run pack:check
+
       - name: Check SKILL.md drift
         run: |
           npm run skill:generate

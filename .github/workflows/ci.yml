@@ -40,6 +40,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Check npm package contents
+        run: npm run pack:check
+
       - name: Check SKILL.md drift
         run: |
           npm run skill:generate
@@ -68,7 +71,10 @@ jobs:
         run: bunx vitest run
 
       - name: Build
-        run: bunx tsup
+        run: bun run build
+
+      - name: Check npm package contents
+        run: bun run pack:check
 
       - name: Check SKILL.md drift
         run: |
