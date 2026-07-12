@@ -1,0 +1,31 @@
+# Command Reference
+
+Read this file for exact arguments, flags, and defaults after selecting a branch from `SKILL.md`.
+
+| Command | Description | Arguments | Flags |
+| --- | --- | --- | --- |
+| moodle activities | List activities in a course. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle alerts | List notifications and message counts. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
+| moodle assign | Show assignment details. | <assign> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle course | Show course detail with sections. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle courses | List enrolled courses. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle folder | Show folder details. | <folder> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle forum | Forum utilities. |  |  |
+| moodle forum check | Validate discussion rendering. | <forum> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
+| moodle forum discussion | Show posts in a forum discussion. | <discussion> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--post (value required)<br>--body |
+| moodle forum discussions | List discussions from a forum. | <forum> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 50; value required)<br>--query (value required) |
+| moodle forum find | Find the best forum match. | <query> | --list<br>--body<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--forum (value required)<br>--titles-only<br>--unread-only<br>--recent<br>--limit-forums (value required)<br>--limit-discussions (value required)<br>--limit (default: 5; value required) |
+| moodle forum forums | List forum activities. | [query] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--limit (default: 50; value required) |
+| moodle forum search | Search forum discussion titles and post text. | <query> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--forum (value required)<br>--titles-only<br>--unread-only<br>--recent<br>--limit-forums (value required)<br>--limit-discussions (value required)<br>--limit (default: 20; value required) |
+| moodle grades | Show grade details for a course. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle link | Show link details. | <link> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle overview | Show a compact multi-source overview. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--todo-limit (default: 5; value required)<br>--todo-days (value required)<br>--alerts-limit (default: 5; value required) |
+| moodle page | Show page details. | <page> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle quiz | Show quiz details. | <quiz> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle resource | Show resource details. | <resource> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle skills | Show skill metadata or delegate to the shared skills CLI. |  |  |
+| moodle skills add | Install the published skill through npx skills add. |  |  |
+| moodle skills generate | Regenerate the agent skill bundle from the CLI command tree. |  |  |
+| moodle todo | List upcoming actionable timeline items. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required)<br>--days (value required) |
+| moodle update | Check for updates and upgrade the installed CLI. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--check-only |
+| moodle user | Show authenticated user info. |  | --json<br>--yaml<br>--table<br>--fields (value required) |

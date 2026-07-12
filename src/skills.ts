@@ -1,5 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Command } from "commander";
 
@@ -7,7 +7,7 @@ export const SKILL_NAME = "moodle-cli";
 export const SKILL_SOURCE = "https://github.com/bunizao/moodle-cli";
 export const SKILLS_SPEC_URL = "https://github.com/vercel-labs/skills";
 export const SKILL_DESCRIPTION =
-  "Inspect Moodle data from the terminal with the `moodle` CLI. Use when an agent needs courses, deadlines, grades, alerts, activities, or forum discussions. Prefer JSON output for agent workflows.";
+  "Read Moodle data with the `moodle` CLI. Use for authenticated profile, course discovery, deadlines, alerts, sections, activities, grades, assignment or quiz detail, resources, forum search and discussions, supported Moodle URLs, authentication diagnostics, or CLI updates.";
 
 export interface SkillFlag {
   name: string;
@@ -39,6 +39,19 @@ interface GenerateOptions {
 
 type RunCommand = typeof spawnSync;
 
+const SKILL_BUNDLE_TEMPLATES = [
+  ["SKILL.md", "skill.template.md"],
+  ["references/setup-and-auth.md", "skill-references/setup-and-auth.md"],
+  ["references/profile-and-courses.md", "skill-references/profile-and-courses.md"],
+  ["references/deadlines-and-alerts.md", "skill-references/deadlines-and-alerts.md"],
+  ["references/coursework-and-grades.md", "skill-references/coursework-and-grades.md"],
+  ["references/forums.md", "skill-references/forums.md"],
+  ["references/output-and-errors.md", "skill-references/output-and-errors.md"],
+  ["references/maintenance.md", "skill-references/maintenance.md"],
+  ["references/command-reference.md", "skill-references/command-reference.md"],
+  ["agents/openai.yaml", "skill-agents/openai.yaml"],
+] as const;
+
 export function formatSkillSummary(): string {
   return [
     `Name: ${SKILL_NAME}`,
@@ -47,7 +60,7 @@ export function formatSkillSummary(): string {
     `Spec: ${SKILLS_SPEC_URL}`,
     `Install: npx skills add ${SKILL_SOURCE}`,
     "CLI alias: moodle skills add (falls back to npm exec)",
-    "Generate: moodle skills generate",
+    "Generate: moodle skills generate (writes SKILL.md, references/, and agents/)",
   ].join("\n");
 }
 
@@ -112,7 +125,14 @@ export function generateSkillMarkdown(input: Command | GenerateOptions): string 
 }
 
 export function writeGeneratedSkill(program: Command, target = "SKILL.md"): void {
-  writeFileSync(target, generateSkillMarkdown(program), "utf8");
+  const commands = extractCommanderCommands(program);
+  const targetDir = path.dirname(target);
+  for (const [relativeTarget, relativeTemplate] of SKILL_BUNDLE_TEMPLATES) {
+    const outputPath = relativeTarget === "SKILL.md" ? target : path.join(targetDir, relativeTarget);
+    mkdirSync(path.dirname(outputPath), { recursive: true });
+    const template = readSkillTemplate(relativeTemplate);
+    writeFileSync(outputPath, renderSkillMarkdown(commands, template), "utf8");
+  }
 }
 
 function renderSkillMarkdown(commands: SkillCommand[], template: string): string {
@@ -303,8 +323,8 @@ function isGenerateOptions(value: Command | GenerateOptions): value is GenerateO
   return "template" in value && "commands" in value;
 }
 
-function readSkillTemplate(): string {
-  return readFileSync(path.join(process.cwd(), "src", "skill.template.md"), "utf8");
+function readSkillTemplate(relativePath = "skill.template.md"): string {
+  return readFileSync(path.join(process.cwd(), "src", relativePath), "utf8");
 }
 
 function findLongFlag(flags: string): string {

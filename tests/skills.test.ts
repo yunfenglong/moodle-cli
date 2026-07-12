@@ -1,4 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -8,6 +11,7 @@ import {
   extractCommanderCommands,
   formatSkillSummary,
   generateSkillMarkdown,
+  writeGeneratedSkill,
 } from "../src/skills.js";
 
 vi.mock("node:child_process", () => ({
@@ -128,5 +132,25 @@ describe("skill generation", () => {
         },
       ],
     }));
+  });
+
+  it("writes a progressively disclosed skill bundle", async () => {
+    const targetDir = join(tmpdir(), `moodle-skill-${process.pid}-${Date.now()}`);
+    const program = new Command("moodle");
+    program.command("todo").description("List upcoming actionable timeline items.").option("--limit <number>", "Maximum number of items.", "20");
+    program.command("courses").description("List enrolled courses.").option("--json", "Output as JSON.");
+
+    writeGeneratedSkill(program, join(targetDir, "SKILL.md"));
+
+    const root = await readFile(join(targetDir, "SKILL.md"), "utf8");
+    const commandReference = await readFile(join(targetDir, "references", "command-reference.md"), "utf8");
+    const outputReference = await readFile(join(targetDir, "references", "output-and-errors.md"), "utf8");
+    const agentMetadata = await readFile(join(targetDir, "agents", "openai.yaml"), "utf8");
+
+    expect(root).toContain("references/deadlines-and-alerts.md");
+    expect(root).toContain("references/command-reference.md");
+    expect(commandReference).toContain("| moodle todo | List upcoming actionable timeline items. |");
+    expect(outputReference).toContain("`--fields a,b,c` keeps only listed top-level fields");
+    expect(agentMetadata).toContain('display_name: "Moodle CLI"');
   });
 });

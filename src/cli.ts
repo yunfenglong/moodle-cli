@@ -238,9 +238,9 @@ export function buildProgram(io: CliIO = {}): Command {
   skills.action(() => {
     stdout.write(`${formatSkillSummary()}\n`);
   });
-  skills.command("generate").description("Regenerate SKILL.md from the CLI command tree.").action(() => {
+  skills.command("generate").description("Regenerate the agent skill bundle from the CLI command tree.").action(() => {
     writeGeneratedSkill(program);
-    stdout.write("Generated SKILL.md\n");
+    stdout.write("Generated Moodle skill bundle\n");
   });
   skills.command("add").description("Install the published skill through npx skills add.").allowUnknownOption(true).action((_options, command) => installSkill(command.args));
   hideCommand(skills.command("install").allowUnknownOption(true)).action((_options: unknown, command: Command) => installSkill(command.args));

@@ -137,15 +137,19 @@ The CLI alias delegates to the same command:
 moodle skills add
 ```
 
-Regenerate `SKILL.md` from the command tree:
+Regenerate the skill bundle from the command tree and source templates:
 
 ```bash
 npm run build
 npm run skill:generate
-git diff --exit-code SKILL.md
+git diff --exit-code -- SKILL.md references agents/openai.yaml
 ```
 
+`SKILL.md` routes agents to focused guidance under `references/`; the exact command and output references remain generated from the CLI.
+
 ## Development
+
+The project typechecks with TypeScript 7 and bundles the Node.js CLI with tsup/esbuild.
 
 ```bash
 npm install

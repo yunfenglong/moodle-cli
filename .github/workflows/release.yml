@@ -81,10 +81,10 @@ jobs:
       - name: Smoke test packed CLI
         run: npm run pack:smoke
 
-      - name: Check SKILL.md drift
+      - name: Check skill bundle drift
         run: |
           npm run skill:generate
-          git diff --exit-code SKILL.md
+          git diff --exit-code -- SKILL.md references agents/openai.yaml
 
       - name: Check npm publication state
         id: npm
