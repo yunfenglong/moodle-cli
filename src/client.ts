@@ -5,14 +5,11 @@ import {
   COURSE_PATH,
   DASHBOARD_PATH,
   FOLDER_VIEW_PATH,
-  FORUM_DISCUSS_PATH,
-  FORUM_VIEW_PATH,
   FUNC_GET_ACTION_EVENTS,
   FUNC_GET_CONVERSATION_COUNTS,
   FUNC_GET_COURSE_CONTENTS,
   FUNC_GET_COURSES,
   FUNC_GET_COURSES_BY_TIMELINE,
-  FUNC_GET_DISCUSSION_POSTS,
   FUNC_GET_POPUP_NOTIFICATIONS,
   FUNC_GET_SITE_INFO,
   FUNC_GET_UNREAD_CONVERSATION_COUNTS,
@@ -26,6 +23,8 @@ import {
 } from "./constants.js";
 import { getAuthenticatedSession, type AuthOptions, type AuthenticatedSession, type MoodleSessionCookie } from "./auth.js";
 import { isLoginRequiredError, MoodleAPIError, NotFoundError } from "./errors.js";
+import { ForumModule } from "./forum.js";
+import { searchForumContent as searchForumModule } from "./forum-search.js";
 import type {
   AlertSummary,
   Assignment,
@@ -50,7 +49,6 @@ import {
   parseAlertSummary,
   parseCourseContents,
   parseCourses,
-  parseForumDiscussion,
   parseTodoItems,
   parseUserInfo,
 } from "./parsers.js";
@@ -63,11 +61,6 @@ import {
   parseCourseIdFromPageHtml,
   parseCourseSectionNumbers,
   parseFolderHtml,
-  parseForumDiscussionGroupHtml,
-  parseForumDiscussionHtml,
-  parseForumDiscussionRefsHtml,
-  parseForumGroupsHtml,
-  parseForumViewCmidFromDiscussionHtml,
   parseGradeOverviewRows,
   parseLinkHtml,
   parsePageContext,
@@ -120,8 +113,7 @@ export class MoodleClient {
   private cacheOptions?: SessionCacheOptions;
   private onLoginRequired?: () => Promise<{ cookie: MoodleSessionCookie; pageContext: PageContext }>;
   private retryingLogin = false;
-  private forumDiscussions = new Map<number, ForumDiscussion>();
-  private forumRefs = new Map<number, ForumDiscussionRef[]>();
+  private readonly forum: ForumModule;
 
   constructor(baseUrl: string, options: ClientOptions | string) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
@@ -135,6 +127,16 @@ export class MoodleClient {
     this.userInfo = resolvedOptions.pageContext?.user_info ?? null;
     this.cacheOptions = resolvedOptions.cacheOptions;
     this.onLoginRequired = resolvedOptions.onLoginRequired;
+    this.forum = new ForumModule({
+      baseUrl: this.baseUrl,
+      call: async (functionName, args) => {
+        await this.ensureSession();
+        return this.call(functionName, args);
+      },
+      getPage: (path, params) => this.get(path, params),
+      getCourses: () => this.getCourses(),
+      getCourseContents: (courseId) => this.getCourseContents(courseId),
+    });
   }
 
   async getSiteInfo(): Promise<UserInfo> {
@@ -348,44 +350,11 @@ export class MoodleClient {
   }
 
   async getForumDiscussion(discussionId: number): Promise<ForumDiscussion> {
-    const cached = this.forumDiscussions.get(discussionId);
-    if (cached) {
-      return cached;
-    }
-    await this.ensureSession();
-    try {
-      const data = await this.call(FUNC_GET_DISCUSSION_POSTS, {
-        discussionid: discussionId,
-        sortby: "created",
-        sortdirection: "ASC",
-        includeinlineattachments: true,
-      });
-      const discussion = parseForumDiscussion(data, discussionId);
-      if (discussion.group_id <= 0) {
-        try {
-          const html = await this.get(FORUM_DISCUSS_PATH, { d: discussionId });
-          [discussion.group_id, discussion.group_name] = parseForumDiscussionGroupHtml(html);
-        } catch {
-          // Group metadata is best effort.
-        }
-      }
-      this.forumDiscussions.set(discussionId, discussion);
-      return discussion;
-    } catch (error) {
-      if (
-        !(error instanceof MoodleAPIError) ||
-        !["servicenotavailable", "accessexception"].includes(error.moodleErrorCode ?? "")
-      ) {
-        throw error;
-      }
-    }
-    const discussion = parseForumDiscussionHtml(await this.get(FORUM_DISCUSS_PATH, { d: discussionId }), this.baseUrl, discussionId);
-    this.forumDiscussions.set(discussionId, discussion);
-    return discussion;
+    return this.forum.getForumDiscussion(discussionId);
   }
 
   async getForumViewCmid(discussionId: number): Promise<number | null> {
-    return parseForumViewCmidFromDiscussionHtml(await this.get(FORUM_DISCUSS_PATH, { d: discussionId }));
+    return this.forum.getForumViewCmid(discussionId);
   }
 
   async resolveCourseIdForUrl(url: string): Promise<number | null> {
@@ -393,55 +362,11 @@ export class MoodleClient {
   }
 
   async getForumDiscussionRefs(forumCmid: number): Promise<ForumDiscussionRef[]> {
-    const cached = this.forumRefs.get(forumCmid);
-    if (cached) {
-      return cached;
-    }
-    const rootHtml = await this.get(FORUM_VIEW_PATH, { id: forumCmid });
-    const groups = parseForumGroupsHtml(rootHtml);
-    const refs = groups.length ? [] : parseForumDiscussionRefsHtml(rootHtml, this.baseUrl);
-    const seen = new Set(refs.map((ref) => ref.id));
-    for (const [groupId, groupName] of groups) {
-      const html = await this.get(FORUM_VIEW_PATH, { id: forumCmid, group: groupId });
-      for (const ref of parseForumDiscussionRefsHtml(html, this.baseUrl)) {
-        if (seen.has(ref.id)) {
-          continue;
-        }
-        ref.group_id = groupId;
-        ref.group_name = groupName;
-        seen.add(ref.id);
-        refs.push(ref);
-      }
-    }
-    this.forumRefs.set(forumCmid, refs);
-    return refs;
-  }
-
-  async getCourseForums(courseId: number, courseName = ""): Promise<ForumActivityRef[]> {
-    const sections = await this.getCourseContents(courseId);
-    return sections.flatMap((section) =>
-      section.activities
-        .filter((activity) => activity.modname === "forum")
-        .map((activity) => ({
-          id: activity.id,
-          name: activity.name,
-          course_id: courseId,
-          course_name: courseName,
-          url: activity.url,
-        })),
-    );
+    return this.forum.getForumDiscussionRefs(forumCmid);
   }
 
   async getForums(courseId?: number): Promise<ForumActivityRef[]> {
-    if (courseId !== undefined) {
-      const courseName = (await this.getCourses()).find((course) => course.id === courseId);
-      return this.getCourseForums(courseId, courseName?.fullname || courseName?.shortname || "");
-    }
-    const refs: ForumActivityRef[] = [];
-    for (const course of await this.getCourses()) {
-      refs.push(...(await this.getCourseForums(course.id, course.fullname || course.shortname)));
-    }
-    return refs;
+    return this.forum.getForums(courseId);
   }
 
   async searchForumContent(options: {
@@ -455,93 +380,8 @@ export class MoodleClient {
     maxForums?: number;
     maxDiscussionsPerForum?: number;
   }): Promise<ForumSearchHit[]> {
-    const query = options.query.trim();
-    if (!query) {
-      return [];
-    }
-    let forums = await this.getForums(options.courseId);
-    if (options.forumCmid !== undefined) {
-      forums = forums.filter((forum) => forum.id === options.forumCmid);
-      if (!forums.length) {
-        forums = [{ id: options.forumCmid, name: "", course_id: 0, course_name: "", url: `${this.baseUrl}${FORUM_VIEW_PATH}?id=${options.forumCmid}` }];
-      }
-    } else if (options.maxForums !== undefined) {
-      forums = forums.slice(0, options.maxForums);
-    }
-
-    const hits: Array<[number, ForumSearchHit]> = [];
-    const seen = new Set<string>();
-    for (const forum of forums) {
-      let refs = await this.getForumDiscussionRefs(forum.id);
-      if (options.maxDiscussionsPerForum !== undefined) {
-        refs = refs.slice(0, options.maxDiscussionsPerForum);
-      }
-      for (const ref of refs) {
-        let discussion: ForumDiscussion | null = null;
-        let latest = 0;
-        let discussionHasUnread = false;
-        if (options.includePostText !== false || options.unreadOnly || options.sortBy === "recent") {
-          discussion = await this.getForumDiscussion(ref.id);
-          latest = Math.max(0, ...discussion.posts.map((post) => post.time_created));
-          discussionHasUnread = discussion.posts.some((post) => post.unread);
-        }
-
-        if (options.includePostText === false) {
-          const score = matchScore(ref.subject, query);
-          if (score > 0 && (!options.unreadOnly || discussionHasUnread)) {
-            addHit(hits, seen, 400 + score, makeHit(forum, ref, { matched_in: "discussion_subject", snippet: snippetForText(ref.subject, query), unread: discussionHasUnread, time_created: latest }));
-          }
-          continue;
-        }
-
-        discussion ??= await this.getForumDiscussion(ref.id);
-        let postMatched = false;
-        for (const post of discussion.posts) {
-          const subjectScore = matchScore(post.subject, query);
-          const bodyScore = matchScore(post.message_text, query);
-          if (subjectScore <= 0 && bodyScore <= 0) {
-            continue;
-          }
-          if (options.unreadOnly && !post.unread) {
-            continue;
-          }
-          postMatched = true;
-          const matched_in = subjectScore >= bodyScore ? "post_subject" : "post_body";
-          const matchedText = matched_in === "post_subject" ? post.subject : post.message_text;
-          addHit(
-            hits,
-            seen,
-            300 + Math.max(subjectScore, bodyScore),
-            makeHit(forum, ref, {
-              group_id: discussion.group_id || ref.group_id,
-              group_name: discussion.group_name || ref.group_name,
-              discussion_subject: discussion.subject || ref.subject,
-              post_id: post.id,
-              author_name: post.author.fullname,
-              matched_in,
-              snippet: snippetForText(matchedText, query),
-              unread: post.unread,
-              time_created: post.time_created,
-              url: post.url || ref.url,
-            }),
-          );
-        }
-        if (!postMatched) {
-          const score = matchScore(ref.subject, query);
-          if (score > 0 && (!options.unreadOnly || discussionHasUnread)) {
-            addHit(hits, seen, 400 + score, makeHit(forum, ref, { matched_in: "discussion_subject", snippet: snippetForText(ref.subject, query), unread: discussionHasUnread, time_created: latest }));
-          }
-        }
-      }
-    }
-
-    hits.sort((a, b) => {
-      if (options.sortBy === "recent") {
-        return b[1].time_created - a[1].time_created || b[0] - a[0] || compareHit(a[1], b[1]);
-      }
-      return b[0] - a[0] || compareHit(a[1], b[1]);
-    });
-    return hits.slice(0, options.limit ?? 20).map(([, hit]) => hit);
+    const { query, ...searchOptions } = options;
+    return searchForumModule(this.forum, query, { ...searchOptions, baseUrl: this.baseUrl });
   }
 
   async callBatch(requests: AjaxCall[]): Promise<AjaxBatchResult[]> {
@@ -749,90 +589,10 @@ function authToClientSession(auth: AuthenticatedSession): { cookie: MoodleSessio
   };
 }
 
-export function filterDiscussionToPost(discussion: ForumDiscussion, postId: number | null): ForumDiscussion {
-  if (postId === null) {
-    return discussion;
-  }
-  const posts = discussion.posts.filter((post) => post.id === postId);
-  if (!posts.length) {
-    throw new NotFoundError(`Post ${postId} was not found in discussion ${discussion.id}.`);
-  }
-  return { ...discussion, posts };
-}
-
 function queryMatches(text: string, query: string): boolean {
   const haystack = text.toLowerCase().split(/\s+/).join(" ");
   const needle = query.toLowerCase().split(/\s+/).join(" ");
   return needle ? haystack.includes(needle) || needle.split(" ").every((token) => haystack.includes(token)) : true;
-}
-
-function matchScore(text: string, query: string): number {
-  const haystack = text.toLowerCase().split(/\s+/).join(" ");
-  const normalized = query.toLowerCase().split(/\s+/).join(" ");
-  const tokens = normalized.split(/\s+/).filter(Boolean);
-  if (!haystack || !normalized) {
-    return 0;
-  }
-  if (haystack.includes(normalized)) {
-    return 100 + normalized.length;
-  }
-  if (tokens.length && tokens.every((token) => haystack.includes(token))) {
-    return 60 + tokens.length;
-  }
-  return 0;
-}
-
-function snippetForText(text: string, query: string, maxLen = 120): string {
-  const cleaned = text.split(/\s+/).join(" ").trim();
-  if (!cleaned || cleaned.length <= maxLen) {
-    return cleaned;
-  }
-  const normalized = query.toLowerCase().split(/\s+/).join(" ");
-  const lower = cleaned.toLowerCase();
-  let start = lower.indexOf(normalized);
-  if (start < 0) {
-    start = normalized.split(/\s+/).map((token) => lower.indexOf(token)).find((index) => index >= 0) ?? -1;
-  }
-  if (start < 0) {
-    return `${cleaned.slice(0, maxLen - 1)}...`;
-  }
-  const left = Math.max(0, start - Math.floor(maxLen / 2));
-  const right = Math.min(cleaned.length, left + maxLen);
-  return `${left > 0 ? "..." : ""}${cleaned.slice(left, right)}${right < cleaned.length ? "..." : ""}`;
-}
-
-function makeHit(forum: ForumActivityRef, ref: ForumDiscussionRef, override: Partial<ForumSearchHit>): ForumSearchHit {
-  return {
-    course_id: forum.course_id,
-    course_name: forum.course_name,
-    forum_id: forum.id,
-    forum_name: forum.name,
-    group_id: ref.group_id,
-    group_name: ref.group_name,
-    discussion_id: ref.id,
-    discussion_subject: ref.subject,
-    post_id: 0,
-    author_name: "",
-    matched_in: "",
-    snippet: "",
-    unread: false,
-    time_created: 0,
-    url: ref.url,
-    ...override,
-  };
-}
-
-function addHit(hits: Array<[number, ForumSearchHit]>, seen: Set<string>, score: number, hit: ForumSearchHit): void {
-  const key = `${hit.discussion_id}:${hit.post_id}`;
-  if (seen.has(key)) {
-    return;
-  }
-  seen.add(key);
-  hits.push([score, hit]);
-}
-
-function compareHit(a: ForumSearchHit, b: ForumSearchHit): number {
-  return a.course_name.localeCompare(b.course_name) || a.forum_name.localeCompare(b.forum_name) || a.discussion_id - b.discussion_id || a.post_id - b.post_id;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { MoodleForumClient, filterDiscussionToPost, parseDiscussionReference, parseForumReference } from "../src/forum.js";
+import { MoodleAPIError } from "../src/errors.js";
+import { ForumModule, filterDiscussionToPost, parseDiscussionReference, parseForumReference } from "../src/forum.js";
 import { formatForumDiscussion } from "../src/formatters.js";
 import type { Course, ForumPost, Section } from "../src/models.js";
 import { parseForumDiscussionHtml, parseForumViewCmidFromDiscussionHtml } from "../src/scraper.js";
@@ -33,47 +34,35 @@ describe("forum read paths", () => {
   });
 
   it("loads a discussion through AJAX and extracts images, links, and tables", async () => {
-    const fetchCalls: string[] = [];
-    const client = new MoodleForumClient({
+    const calledFunctions: string[] = [];
+    const client = new ForumModule({
       baseUrl: BASE_URL,
-      sesskey: "abc123",
-      fetch: async (input, init) => {
-        const url = input.toString();
-        fetchCalls.push(`${init?.method ?? "GET"} ${url}`);
-        if (url.includes("/lib/ajax/service.php")) {
-          return jsonResponse([
+      call: async (functionName) => {
+        calledFunctions.push(functionName);
+        return {
+          courseid: 101,
+          forumid: 501,
+          posts: [
             {
-              error: false,
-              data: {
-                courseid: 101,
-                forumid: 501,
-                posts: [
-                  {
-                    id: 9101,
-                    discussionid: 7001,
-                    subject: "Exam deadline questions",
-                    message:
-                      '<p>Please check the <a href="/mod/resource/view.php?id=55">schedule</a>.</p><img src="/pluginfile.php/1/image.png" alt="diagram"><table><tr><th>Type</th><th>Code</th></tr><tr><td>Tutorial</td><td>685B5</td></tr></table>',
-                    author: { id: 12, fullname: "Alice Example", urls: { profile: `${BASE_URL}/user/view.php?id=12` } },
-                    timecreated: 100,
-                    unread: true,
-                    urls: { view: `${BASE_URL}/mod/forum/discuss.php?d=7001#p9101`, reply: `${BASE_URL}/mod/forum/post.php?reply=9101` },
-                  },
-                ],
-              },
+              id: 9101,
+              discussionid: 7001,
+              subject: "Exam deadline questions",
+              message:
+                '<p>Please check the <a href="/mod/resource/view.php?id=55">schedule</a>.</p><img src="/pluginfile.php/1/image.png" alt="diagram"><table><tr><th>Type</th><th>Code</th></tr><tr><td>Tutorial</td><td>685B5</td></tr></table>',
+              author: { id: 12, fullname: "Alice Example", urls: { profile: `${BASE_URL}/user/view.php?id=12` } },
+              timecreated: 100,
+              unread: true,
+              urls: { view: `${BASE_URL}/mod/forum/discuss.php?d=7001#p9101`, reply: `${BASE_URL}/mod/forum/post.php?reply=9101` },
             },
-          ]);
-        }
-        if (url.includes("/mod/forum/discuss.php")) {
-          return htmlResponse(fixture("forum-discussion.html"));
-        }
-        throw new Error(`Unexpected fetch: ${url}`);
+          ],
+        };
       },
+      getPage: async () => fixture("forum-discussion.html"),
     });
 
     const discussion = await client.getForumDiscussion(7001);
 
-    expect(fetchCalls[0]).toContain("POST");
+    expect(calledFunctions).toEqual(["mod_forum_get_discussion_posts"]);
     expect(discussion.group_id).toBe(10);
     expect(discussion.group_name).toBe("Tutorial A");
     expect(discussion.posts[0].image_urls).toEqual([`${BASE_URL}/pluginfile.php/1/image.png`]);
@@ -83,19 +72,10 @@ describe("forum read paths", () => {
 
   it("falls back to discussion page scraping and resolves forum cmid", async () => {
     const html = fixture("forum-discussion.html");
-    const client = new MoodleForumClient({
+    const client = new ForumModule({
       baseUrl: BASE_URL,
-      sesskey: "abc123",
-      fetch: async (input) => {
-        const url = input.toString();
-        if (url.includes("/lib/ajax/service.php")) {
-          return jsonResponse([{ error: true, exception: { errorcode: "servicenotavailable", message: "disabled" } }]);
-        }
-        if (url.includes("/mod/forum/discuss.php")) {
-          return htmlResponse(html);
-        }
-        throw new Error(`Unexpected fetch: ${url}`);
-      },
+      call: async () => { throw new MoodleAPIError("disabled", "servicenotavailable"); },
+      getPage: async () => html,
     });
 
     const discussion = await client.getForumDiscussion(7001);
@@ -109,18 +89,22 @@ describe("forum read paths", () => {
 
   it("collects grouped forum discussions from non-default groups", async () => {
     const calls: string[] = [];
-    const client = new MoodleForumClient({
+    const client = new ForumModule({
       baseUrl: BASE_URL,
-      fetch: async (input) => {
-        const url = new URL(input.toString());
+      call: async () => { throw new Error("Unexpected AJAX call"); },
+      getPage: async (path, params) => {
+        const url = new URL(path, BASE_URL);
+        for (const [key, value] of Object.entries(params)) {
+          url.searchParams.set(key, String(value));
+        }
         calls.push(`${url.pathname}?${url.searchParams.toString()}`);
         if (url.searchParams.get("group") === "10") {
-          return htmlResponse(fixture("forum-view-group-a.html"));
+          return fixture("forum-view-group-a.html");
         }
         if (url.searchParams.get("group") === "20") {
-          return htmlResponse(fixture("forum-view-group-b.html"));
+          return fixture("forum-view-group-b.html");
         }
-        return htmlResponse(fixture("forum-view-default-grouped.html"));
+        return fixture("forum-view-default-grouped.html");
       },
     });
 
@@ -150,8 +134,10 @@ describe("forum read paths", () => {
         ],
       },
     ];
-    const client = new MoodleForumClient({
+    const client = new ForumModule({
       baseUrl: BASE_URL,
+      call: async () => { throw new Error("Unexpected AJAX call"); },
+      getPage: async () => { throw new Error("Unexpected page load"); },
       getCourses: async () => courses,
       getCourseContents: async () => sections,
     });
@@ -185,14 +171,6 @@ describe("forum read paths", () => {
 
 function fixture(name: string): string {
   return readFileSync(join(FIXTURE_DIR, name), "utf8");
-}
-
-function jsonResponse(value: unknown): Response {
-  return new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json" } });
-}
-
-function htmlResponse(value: string): Response {
-  return new Response(value, { status: 200, headers: { "content-type": "text/html" } });
 }
 
 function forumPost(overrides: Partial<ForumPost> = {}): ForumPost {

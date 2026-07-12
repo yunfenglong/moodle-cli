@@ -76,6 +76,33 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("MoodleClient course/activity modules", () => {
+  it("initializes the authenticated session before loading a forum discussion", async () => {
+    const { seen } = installFetch([
+      dashboardRoute,
+      ajaxRoute("mod_forum_get_discussion_posts", {
+        courseid: 101,
+        forumid: 501,
+        posts: [{
+          id: 9101,
+          discussionid: 7001,
+          subject: "Exam deadline questions",
+          message: '<p>See the <a href="/mod/resource/view.php?id=55">schedule</a>.</p>',
+          author: { id: 12, fullname: "Alice Example", urls: {} },
+          urls: { view: `${BASE_URL}/mod/forum/discuss.php?d=7001#p9101` },
+        }],
+      }),
+      (request) => request.url === `${BASE_URL}/mod/forum/discuss.php?d=7001`
+        ? htmlResponse(fixture("forum-discussion.html"))
+        : undefined,
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    const discussion = await client.getForumDiscussion(7001);
+
+    expect(seen[0].url).toBe(`${BASE_URL}/my/`);
+    expect(discussion.posts[0].links).toEqual([{ text: "schedule", url: `${BASE_URL}/mod/resource/view.php?id=55` }]);
+  });
+
   it("loads courses through the primary AJAX function and resolves course references", async () => {
     installFetch([dashboardRoute, ajaxRoute("core_enrol_get_users_courses", jsonFixture("courses.json"))]);
     const client = new MoodleClient(BASE_URL, "session");

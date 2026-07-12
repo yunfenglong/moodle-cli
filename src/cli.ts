@@ -1,7 +1,7 @@
 import { Command, CommanderError } from "commander";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createMoodleClient, filterDiscussionToPost, type MoodleClient } from "./client.js";
+import { createMoodleClient, type MoodleClient } from "./client.js";
 import { loadConfig } from "./config.js";
 import { CliError, ConfigError, MoodleAPIError, UsageError, toCliError } from "./errors.js";
 import {
@@ -24,7 +24,9 @@ import { formatSkillSummary, installSkill, writeGeneratedSkill } from "./skills.
 import { checkForUpdates, applySelfUpdate } from "./update.js";
 import { VERSION } from "./version.js";
 import { ASSIGN_VIEW_PATH, FOLDER_VIEW_PATH, PAGE_VIEW_PATH, QUIZ_VIEW_PATH, RESOURCE_VIEW_PATH, URL_VIEW_PATH } from "./constants.js";
-import { looksLikeUrl, parseActivityReference, parseDiscussionReference, resolveTopLevelUrl } from "./url-resolver.js";
+import { filterDiscussionToPost, parseDiscussionReference, parseForumReference } from "./forum.js";
+import { checkForumDiscussions } from "./forum-search.js";
+import { looksLikeUrl, parseActivityReference, resolveTopLevelUrl } from "./url-resolver.js";
 
 interface CliIO {
   stdout?: NodeJS.WriteStream | { write(chunk: string): boolean };
@@ -173,7 +175,7 @@ export function buildProgram(io: CliIO = {}): Command {
     .option("--query <query>", "Filter discussion titles by query.")
     .action(async (forumRef: string, options: OutputCommandOptions & { limit: number; query?: string }) => {
       const client = await runtime.getClient();
-      const forumId = await parseForumReference(client, forumRef);
+      const forumId = await parseForumReference(forumRef, (discussionId) => client.getForumViewCmid(discussionId));
       let refs = await client.getForumDiscussionRefs(forumId);
       if (options.query) {
         refs = refs.filter((ref) => queryMatches(ref.subject, options.query!));
@@ -203,23 +205,8 @@ export function buildProgram(io: CliIO = {}): Command {
     .option("--limit <number>", "Maximum number of discussions.", parsePositiveInt, 20)
     .action(async (forumRef: string, options: OutputCommandOptions & { limit: number }) => {
       const client = await runtime.getClient();
-      const forumId = await parseForumReference(client, forumRef);
-      const refs = (await client.getForumDiscussionRefs(forumId)).slice(0, options.limit);
-      const results: Array<{ discussion_id: number; subject: string; ok: boolean; posts?: number; images?: number; error?: string }> = [];
-      for (const ref of refs) {
-        try {
-          const discussion = await client.getForumDiscussion(ref.id);
-          results.push({
-            discussion_id: ref.id,
-            subject: ref.subject,
-            ok: true,
-            posts: discussion.posts.length,
-            images: discussion.posts.reduce((total, post) => total + post.image_urls.length, 0),
-          });
-        } catch (error) {
-          results.push({ discussion_id: ref.id, subject: ref.subject, ok: false, error: error instanceof Error ? error.message : String(error) });
-        }
-      }
+      const forumId = await parseForumReference(forumRef, (discussionId) => client.getForumViewCmid(discussionId));
+      const results = await checkForumDiscussions(client, forumId, options.limit);
       runtime.output(results, () => formatForumCheckResults(forumId, results), options);
     });
 
@@ -395,7 +382,9 @@ function addForumSearchCommand(command: Command, runtime: Runtime, defaultLimit:
     .action(async (query: string, options: OutputCommandOptions & { course?: string; forum?: string; titlesOnly?: boolean; unreadOnly?: boolean; recent?: boolean; limitForums?: number; limitDiscussions?: number; limit: number; list?: boolean; body?: boolean }) => {
       const client = await runtime.getClient();
       const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
-      const forumCmid = options.forum ? await parseForumReference(client, options.forum) : undefined;
+      const forumCmid = options.forum
+        ? await parseForumReference(options.forum, (discussionId) => client.getForumViewCmid(discussionId))
+        : undefined;
       const limit = findMode && !options.list ? 1 : options.limit;
       const hits = await client.searchForumContent({
         query,
@@ -416,30 +405,6 @@ function addForumSearchCommand(command: Command, runtime: Runtime, defaultLimit:
       const output = findMode && !options.list ? (hits[0] ?? null) : hits;
       runtime.output(output, () => formatForumSearchHits(Array.isArray(output) ? output : output ? [output] : []), options);
     });
-}
-
-async function parseForumReference(client: MoodleClient, value: string): Promise<number> {
-  const raw = value.trim();
-  if (/^\d+$/.test(raw)) {
-    return Number(raw);
-  }
-  const parsed = new URL(raw);
-  if (parsed.pathname.endsWith("/mod/forum/view.php")) {
-    const id = parsed.searchParams.get("id");
-    if (id && /^\d+$/.test(id)) {
-      return Number(id);
-    }
-  }
-  if (parsed.pathname.endsWith("/mod/forum/discuss.php")) {
-    const id = parsed.searchParams.get("d");
-    if (id && /^\d+$/.test(id)) {
-      const forumId = await client.getForumViewCmid(Number(id));
-      if (forumId) {
-        return forumId;
-      }
-    }
-  }
-  throw new UsageError("Unsupported forum URL. Use a view.php?id=... or discuss.php?d=... URL.");
 }
 
 function addOutputOptions(command: Command): Command {

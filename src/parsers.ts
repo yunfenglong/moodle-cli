@@ -10,6 +10,7 @@ import type {
   TodoItem,
   UserInfo,
 } from "./models.js";
+import { htmlToStructuredContent } from "./html-utils.js";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -175,18 +176,20 @@ export function parseForumPostAuthor(value: unknown): ForumPostAuthor {
   };
 }
 
-export function parseForumPost(value: unknown): ForumPost {
+export function parseForumPost(value: unknown, baseUrl = ""): ForumPost {
   const data = asRecord(value);
   const urls = asRecord(data.urls);
+  const messageHtml = stringValue(data.message);
+  const structured = htmlToStructuredContent(messageHtml, stringValue(urls.view || urls.discuss) || baseUrl);
   return {
     id: numberValue(data.id),
     discussion_id: numberValue(data.discussionid),
     subject: stringValue(data.subject),
-    message_html: stringValue(data.message),
-    message_text: stringValue(data.message).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
-    image_urls: [],
-    links: [],
-    tables: [],
+    message_html: messageHtml,
+    message_text: structured.text,
+    image_urls: structured.image_urls,
+    links: structured.links,
+    tables: structured.tables,
     author: parseForumPostAuthor(data.author),
     parent_id: numberValue(data.parentid),
     time_created: numberValue(data.timecreated),
@@ -200,9 +203,9 @@ export function parseForumPost(value: unknown): ForumPost {
   };
 }
 
-export function parseForumDiscussion(value: unknown, discussionId: number): ForumDiscussion {
+export function parseForumDiscussion(value: unknown, discussionId: number, baseUrl = ""): ForumDiscussion {
   const data = asRecord(value);
-  const posts = asArray(data.posts).map((item) => parseForumPost(item));
+  const posts = asArray(data.posts).map((item) => parseForumPost(item, baseUrl));
   return {
     id: discussionId,
     subject: posts[0]?.subject ?? "",

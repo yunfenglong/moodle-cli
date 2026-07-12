@@ -163,22 +163,3 @@ function queryMatches(text: string, query: string): boolean {
   const needle = query.toLowerCase().split(/\s+/).join(" ");
   return needle ? haystack.includes(needle) || needle.split(" ").every((token) => haystack.includes(token)) : true;
 }
-
-export function parseDiscussionReference(value: string): { discussionId: number; postId: number | null } {
-  const raw = value.trim();
-  if (/^\d+$/.test(raw)) {
-    return { discussionId: Number(raw), postId: null };
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    throw new UsageError("DISCUSSION must be a numeric ID or a full discuss.php URL.");
-  }
-  const discussion = parsed.searchParams.get("d");
-  if (!discussion || !/^\d+$/.test(discussion)) {
-    throw new UsageError("Could not find discussion ID in URL query (expected ?d=...).");
-  }
-  const postId = parsed.hash.startsWith("#p") && /^\d+$/.test(parsed.hash.slice(2)) ? Number(parsed.hash.slice(2)) : null;
-  return { discussionId: Number(discussion), postId };
-}

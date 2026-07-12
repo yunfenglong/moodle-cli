@@ -1,7 +1,7 @@
-import { AJAX_SERVICE_PATH, FORUM_DISCUSS_PATH, FORUM_VIEW_PATH, FUNC_GET_DISCUSSION_POSTS } from "./constants.js";
+import { FORUM_DISCUSS_PATH, FORUM_VIEW_PATH, FUNC_GET_DISCUSSION_POSTS } from "./constants.js";
 import { MoodleAPIError, NotFoundError, UsageError } from "./errors.js";
-import { htmlToStructuredContent } from "./html-utils.js";
-import type { Course, ForumActivityRef, ForumDiscussion, ForumPost, ForumPostAuthor, Section } from "./models.js";
+import type { Course, ForumActivityRef, ForumDiscussion, ForumDiscussionRef, Section } from "./models.js";
+import { parseForumDiscussion } from "./parsers.js";
 import {
   parseForumDiscussionGroupHtml,
   parseForumDiscussionHtml,
@@ -10,29 +10,27 @@ import {
   parseForumViewCmidFromDiscussionHtml,
 } from "./scraper.js";
 
-export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
-
-export interface MoodleForumClientOptions {
+export interface ForumAdapter {
   baseUrl: string;
-  sesskey?: string;
-  fetch?: FetchLike;
+  call: (functionName: string, args: Record<string, unknown>) => Promise<unknown>;
+  getPage: (path: string, params: Record<string, string | number>) => Promise<string>;
   getCourses?: () => Promise<Course[]>;
   getCourseContents?: (courseId: number) => Promise<Section[]>;
 }
 
-export class MoodleForumClient {
+export class ForumModule {
   readonly baseUrl: string;
-  private readonly sesskey: string;
-  private readonly fetchImpl: FetchLike;
+  private readonly callMoodle: ForumAdapter["call"];
+  private readonly loadPage: ForumAdapter["getPage"];
   private readonly loadCourses?: () => Promise<Course[]>;
   private readonly loadCourseContents?: (courseId: number) => Promise<Section[]>;
   private readonly forumDiscussionCache = new Map<number, ForumDiscussion>();
   private readonly forumDiscussionRefsCache = new Map<number, ForumDiscussionRef[]>();
 
-  constructor(options: MoodleForumClientOptions) {
+  constructor(options: ForumAdapter) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
-    this.sesskey = options.sesskey ?? "";
-    this.fetchImpl = options.fetch ?? fetch;
+    this.callMoodle = options.call;
+    this.loadPage = options.getPage;
     this.loadCourses = options.getCourses;
     this.loadCourseContents = options.getCourseContents;
   }
@@ -44,39 +42,37 @@ export class MoodleForumClient {
     }
 
     try {
-      const data = await this.call(FUNC_GET_DISCUSSION_POSTS, {
+      const data = await this.callMoodle(FUNC_GET_DISCUSSION_POSTS, {
         discussionid: discussionId,
         sortby: "created",
         sortdirection: "ASC",
         includeinlineattachments: true,
       });
-      if (isRecord(data)) {
-        const discussion = parseAjaxForumDiscussion(data, discussionId);
-        if (discussion.group_id <= 0) {
-          const html = await this.getPage(FORUM_DISCUSS_PATH, { d: discussionId }).catch(() => "");
-          if (html) {
-            const [groupId, groupName] = parseForumDiscussionGroupHtml(html);
-            discussion.group_id = groupId;
-            discussion.group_name = groupName;
-          }
+      const discussion = parseForumDiscussion(data, discussionId, this.baseUrl);
+      if (discussion.group_id <= 0) {
+        const html = await this.loadPage(FORUM_DISCUSS_PATH, { d: discussionId }).catch(() => "");
+        if (html) {
+          const [groupId, groupName] = parseForumDiscussionGroupHtml(html);
+          discussion.group_id = groupId;
+          discussion.group_name = groupName;
         }
-        this.forumDiscussionCache.set(discussionId, discussion);
-        return discussion;
       }
+      this.forumDiscussionCache.set(discussionId, discussion);
+      return discussion;
     } catch (error) {
       if (!shouldFallbackForumAjax(error)) {
         throw error;
       }
     }
 
-    const html = await this.getPage(FORUM_DISCUSS_PATH, { d: discussionId });
+    const html = await this.loadPage(FORUM_DISCUSS_PATH, { d: discussionId });
     const discussion = parseForumDiscussionHtml(html, this.baseUrl, discussionId);
     this.forumDiscussionCache.set(discussionId, discussion);
     return discussion;
   }
 
   async getForumViewCmid(discussionId: number): Promise<number | null> {
-    const html = await this.getPage(FORUM_DISCUSS_PATH, { d: discussionId });
+    const html = await this.loadPage(FORUM_DISCUSS_PATH, { d: discussionId });
     return parseForumViewCmidFromDiscussionHtml(html);
   }
 
@@ -86,13 +82,13 @@ export class MoodleForumClient {
       return cached;
     }
 
-    const html = await this.getPage(FORUM_VIEW_PATH, { id: forumCmid });
+    const html = await this.loadPage(FORUM_VIEW_PATH, { id: forumCmid });
     const groups = parseForumGroupsHtml(html);
     const refs = groups.length ? [] : parseForumDiscussionRefsHtml(html, this.baseUrl);
     const seenIds = new Set(refs.map((ref) => ref.id));
 
     for (const [groupId, groupName] of groups) {
-      const groupHtml = await this.getPage(FORUM_VIEW_PATH, { id: forumCmid, group: groupId });
+      const groupHtml = await this.loadPage(FORUM_VIEW_PATH, { id: forumCmid, group: groupId });
       for (const ref of parseForumDiscussionRefsHtml(groupHtml, this.baseUrl)) {
         if (seenIds.has(ref.id)) {
           continue;
@@ -106,7 +102,7 @@ export class MoodleForumClient {
     return refs;
   }
 
-  async getCourseForums(courseId: number, courseName = ""): Promise<ForumActivityRef[]> {
+  private async getCourseForums(courseId: number, courseName = ""): Promise<ForumActivityRef[]> {
     if (!this.loadCourseContents) {
       throw new Error("getCourseContents loader is required to list course forums");
     }
@@ -147,46 +143,6 @@ export class MoodleForumClient {
     return course ? course.fullname || course.shortname : "";
   }
 
-  private async call(functionName: string, args: Record<string, unknown>): Promise<unknown> {
-    const url = new URL(`${this.baseUrl}${AJAX_SERVICE_PATH}`);
-    url.searchParams.set("sesskey", this.sesskey);
-    url.searchParams.set("info", functionName);
-
-    const response = await this.fetchImpl(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify([{ index: 0, methodname: functionName, args }]),
-    });
-    if (!response.ok) {
-      throw new Error(`Moodle request failed with HTTP ${response.status}`);
-    }
-
-    const result: unknown = await response.json();
-    if (Array.isArray(result) && result.length > 0 && isRecord(result[0])) {
-      const item = result[0];
-      if (item.error) {
-        const exception = isRecord(item.exception) ? item.exception : {};
-        throw new MoodleAPIError(stringValue(exception.message) || "Unknown API error", stringValue(exception.errorcode) || undefined);
-      }
-      return item.data ?? item;
-    }
-    if (isRecord(result) && result.error) {
-      throw new MoodleAPIError(stringValue(result.message) || "Unknown error", stringValue(result.errorcode) || undefined);
-    }
-    return result;
-  }
-
-  private async getPage(path: string, params: Record<string, string | number>): Promise<string> {
-    const url = new URL(`${this.baseUrl}${path}`);
-    for (const [key, value] of Object.entries(params)) {
-      url.searchParams.set(key, String(value));
-    }
-    const response = await this.fetchImpl(url);
-    if (!response.ok) {
-      throw new Error(`Moodle request failed with HTTP ${response.status}`);
-    }
-    return response.text();
-  }
 }
 
 export function parseDiscussionReference(value: string): { discussionId: number; postId: number | null } {
@@ -265,58 +221,6 @@ export function filterDiscussionToPost(discussion: ForumDiscussion, postId: numb
   return { ...discussion, posts };
 }
 
-function parseAjaxForumDiscussion(data: Record<string, unknown>, discussionId: number): ForumDiscussion {
-  const posts = asArray(data.posts)
-    .filter(isRecord)
-    .map((post) => parseAjaxForumPost(post));
-  return {
-    id: discussionId,
-    subject: posts[0]?.subject ?? "",
-    course_id: numberValue(data.courseid),
-    forum_id: numberValue(data.forumid),
-    group_id: numberValue(data.groupid),
-    group_name: stringValue(data.groupname),
-    url: posts[0]?.url ? posts[0].url.split("#", 1)[0] : "",
-    posts,
-  };
-}
-
-function parseAjaxForumPost(data: Record<string, unknown>): ForumPost {
-  const urls = isRecord(data.urls) ? data.urls : {};
-  const messageHtml = stringValue(data.message);
-  const structured = htmlToStructuredContent(messageHtml, stringValue(urls.view) || stringValue(urls.discuss));
-  return {
-    id: numberValue(data.id),
-    discussion_id: numberValue(data.discussionid),
-    subject: stringValue(data.subject),
-    message_html: messageHtml,
-    message_text: structured.text,
-    image_urls: structured.image_urls,
-    links: structured.links,
-    tables: structured.tables,
-    author: parseAjaxForumPostAuthor(isRecord(data.author) ? data.author : {}),
-    parent_id: numberValue(data.parentid),
-    time_created: numberValue(data.timecreated),
-    time_modified: numberValue(data.timemodified),
-    created_pretty: "",
-    unread: booleanValue(data.unread),
-    is_deleted: booleanValue(data.isdeleted),
-    is_private_reply: booleanValue(data.isprivatereply),
-    url: stringValue(urls.view) || stringValue(urls.viewisolated),
-    reply_url: stringValue(urls.reply),
-  };
-}
-
-function parseAjaxForumPostAuthor(data: Record<string, unknown>): ForumPostAuthor {
-  const urls = isRecord(data.urls) ? data.urls : {};
-  return {
-    id: numberValue(data.id),
-    fullname: stringValue(data.fullname),
-    profile_url: stringValue(urls.profile),
-    profile_image_url: stringValue(urls.profileimage),
-  };
-}
-
 function shouldFallbackForumAjax(error: unknown): boolean {
   if (!(error instanceof MoodleAPIError)) {
     return false;
@@ -326,38 +230,4 @@ function shouldFallbackForumAjax(error: unknown): boolean {
     error.moodleErrorCode === "accessexception" ||
     error.message.includes("Web service is not available")
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value : value == null ? "" : String(value);
-}
-
-function numberValue(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
-    return Number(value);
-  }
-  return 0;
-}
-
-function booleanValue(value: unknown): boolean {
-  return Boolean(value);
-}
-
-interface ForumDiscussionRef {
-  id: number;
-  subject: string;
-  group_id: number;
-  group_name: string;
-  url: string;
 }
