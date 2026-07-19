@@ -19,7 +19,7 @@ Resolve an unfamiliar course name with `moodle courses --json` before using a co
 
 ## Branch Map
 
-- **Installation, configuration, or authentication failure**: read [references/setup-and-auth.md](references/setup-and-auth.md).
+- **Installation, configuration, authentication failure, or session keepalive**: read [references/setup-and-auth.md](references/setup-and-auth.md).
 - **Profile, course discovery, sections, or activity lists**: read [references/profile-and-courses.md](references/profile-and-courses.md).
 - **Deadlines, todo items, alerts, or a combined snapshot**: read [references/deadlines-and-alerts.md](references/deadlines-and-alerts.md).
 - **Grades or assignment, quiz, resource, link, page, and folder detail**: read [references/coursework-and-grades.md](references/coursework-and-grades.md).

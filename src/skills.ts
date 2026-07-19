@@ -220,6 +220,8 @@ function renderIntentTable(): string {
       ["Show grades for a course", "moodle grades COURSE_ID --json"],
       ["Find the best forum match", "moodle forum find QUERY --json"],
       ["Open a forum discussion URL or ID", "moodle forum discussion DISCUSSION_OR_URL --json"],
+      ["Check session freshness or authentication state", "moodle auth status --json"],
+      ["Keep the session alive to avoid repeated logins", "moodle auth keepalive install"],
       ["Check whether the CLI has an update", "moodle update --json"],
       ["Install this agent skill", "moodle skills add"],
     ],
