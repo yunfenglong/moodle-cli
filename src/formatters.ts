@@ -13,6 +13,7 @@ import type {
   TodoItem,
   UserInfo,
 } from "./models.js";
+import type { AuthStatus, KeepaliveRunResult } from "./keepalive.js";
 
 export function formatUser(user: UserInfo): string {
   return formatKeyValues([
@@ -199,6 +200,46 @@ export function formatForumCheckResults(forumCmid: number, rows: ForumCheckResul
     );
   }
   return lines.join("\n");
+}
+
+export function formatAuthStatus(status: AuthStatus): string {
+  return formatKeyValues([
+    ["Site", status.base_url],
+    ["Cached session", status.session_cached ? "yes" : "no"],
+    ["Cache age", status.cache_age_minutes === null ? "" : `${status.cache_age_minutes} min`],
+    ["Session alive", status.session_alive === null ? (status.session_cached ? "unknown" : "") : status.session_alive ? "yes" : "no"],
+    ["Server timeout in", formatDuration(status.session_time_remaining_seconds)],
+    ["Keepalive agent", status.keepalive_installed ? `installed (${status.keepalive_plist_path})` : "not installed"],
+  ]);
+}
+
+export function formatKeepaliveResult(result: KeepaliveRunResult): string {
+  switch (result.status) {
+    case "renewed":
+      return `Session renewed${result.time_remaining_seconds ? `; server timeout in ${formatDuration(result.time_remaining_seconds)}` : ""}`;
+    case "reauthenticated":
+      return "Session was expired; re-authenticated from browser/okta cookies";
+    case "expired":
+      return "Session expired and could not be renewed. Log in to Moodle in your browser or run: moodle auth login";
+    case "no_session":
+      return "No cached session to renew. Run any moodle command once, or: moodle auth login";
+    case "unreachable":
+      return "Could not reach the Moodle site; session state unchanged";
+  }
+}
+
+function formatDuration(seconds: number | null): string {
+  if (seconds === null) {
+    return "";
+  }
+  if (seconds < 90) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) {
+    return `${minutes} min`;
+  }
+  return `${(minutes / 60).toFixed(1)} h`;
 }
 
 function preview(value: string, maxLen = 100): string {

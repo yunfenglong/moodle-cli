@@ -60,6 +60,7 @@ export interface AuthOptions {
   noCache?: boolean;
   cacheTtlMs?: number;
   now?: () => number;
+  nonInteractive?: boolean;
 }
 
 interface ChromeCookiesSecure {
@@ -110,7 +111,7 @@ export async function getAuthenticatedSession(
     return { baseUrl, cookie: oktaSession.cookie, ...oktaSession.context, fromCache: false };
   }
 
-  if (!options.oktaCookieProvider && oktaCookies.length) {
+  if (!options.oktaCookieProvider && oktaCookies.length && !options.nonInteractive) {
     const refreshed = matchingMoodleSessionCookies(
       await loadSessionsFromOktaCli(baseUrl, { ...options, oktaCookieProvider: undefined, noCache: true }, true),
       baseUrl,
@@ -177,7 +178,7 @@ export async function loadSessionsFromOktaCli(
   }
 
   const stored = await readOktaCookies(executable, baseUrl, execFile);
-  if (stored.length && !forceLogin) {
+  if ((stored.length && !forceLogin) || options.nonInteractive) {
     return stored;
   }
 

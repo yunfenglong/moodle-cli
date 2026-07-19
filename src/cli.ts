@@ -8,6 +8,7 @@ import {
   formatActivityDetail,
   formatActivityList,
   formatAlerts,
+  formatAuthStatus,
   formatCourseSections,
   formatCourses,
   formatForumDiscussion,
@@ -16,12 +17,21 @@ import {
   formatForumSearchHits,
   formatForumCheckResults,
   formatGrades,
+  formatKeepaliveResult,
   formatTodo,
   formatUser,
 } from "./formatters.js";
 import { serializeStructured, errorJson, type OutputFormat } from "./output.js";
 import { formatSkillSummary, installSkill, writeGeneratedSkill } from "./skills.js";
 import { checkForUpdates, applySelfUpdate } from "./update.js";
+import {
+  getAuthStatus,
+  installKeepalive,
+  keepAliveOnce,
+  keepaliveStatus,
+  uninstallKeepalive,
+} from "./keepalive.js";
+import { getAuthenticatedSession, invalidateCachedSession } from "./auth.js";
 import { VERSION } from "./version.js";
 import { ASSIGN_VIEW_PATH, FOLDER_VIEW_PATH, PAGE_VIEW_PATH, QUIZ_VIEW_PATH, RESOURCE_VIEW_PATH, URL_VIEW_PATH } from "./constants.js";
 import { filterDiscussionToPost, parseDiscussionReference, parseForumReference } from "./forum.js";
@@ -209,6 +219,62 @@ export function buildProgram(io: CliIO = {}): Command {
       const results = await checkForumDiscussions(client, forumId, options.limit);
       runtime.output(results, () => formatForumCheckResults(forumId, results), options);
     });
+
+  const auth = program.command("auth").description("Session and keepalive utilities.");
+
+  addOutputOptions(auth.command("status").description("Show cached session freshness and keepalive state.")).action(
+    async (options: OutputCommandOptions) => {
+      const baseUrl = await runtime.baseUrl();
+      const status = await getAuthStatus(baseUrl, { homeDir: io.homeDir, fetchImpl: io.fetchImpl });
+      runtime.output(status, () => formatAuthStatus(status), options);
+    },
+  );
+
+  addOutputOptions(auth.command("login").description("Force a fresh login and refresh the session cache.")).action(
+    async (options: OutputCommandOptions) => {
+      const baseUrl = await runtime.baseUrl();
+      await invalidateCachedSession(baseUrl, { homeDir: io.homeDir });
+      const session = await getAuthenticatedSession(baseUrl, { env: io.env, fetch: io.fetchImpl, homeDir: io.homeDir, noCache: true });
+      const result = { base_url: baseUrl, userid: session.userid, cookie_source: session.cookie.source ?? "unknown" };
+      runtime.output(result, () => `Authenticated as userid ${result.userid} via ${result.cookie_source}`, options);
+    },
+  );
+
+  const keepalive = addOutputOptions(
+    auth
+      .command("keepalive")
+      .description("Renew the Moodle session once; used by the background keepalive agent.")
+      .option("--no-renew", "Only touch the session; skip re-login when it is expired."),
+  ).action(async (options: OutputCommandOptions & { renew: boolean }) => {
+    const baseUrl = await runtime.baseUrl();
+    const result = await keepAliveOnce(baseUrl, { homeDir: io.homeDir, fetchImpl: io.fetchImpl, renewOnExpiry: options.renew });
+    runtime.output(result, () => formatKeepaliveResult(result), options);
+  });
+
+  addOutputOptions(
+    keepalive
+      .command("install")
+      .description("Install a macOS launch agent that renews the session periodically.")
+      .option("--interval <minutes>", "Renewal interval in minutes.", parsePositiveInt),
+  ).action(async (options: OutputCommandOptions & { interval?: number }) => {
+    await runtime.baseUrl();
+    const result = await installKeepalive({ homeDir: io.homeDir, intervalMinutes: options.interval });
+    runtime.output(result, () => `Keepalive installed: renews every ${result.interval_minutes} min\nAgent: ${result.plist_path}\nLog: ${result.log_path}`, options);
+  });
+
+  addOutputOptions(keepalive.command("uninstall").description("Remove the keepalive launch agent.")).action(
+    async (options: OutputCommandOptions) => {
+      const result = await uninstallKeepalive({ homeDir: io.homeDir });
+      runtime.output(result, () => `Keepalive removed (${result.plist_path})`, options);
+    },
+  );
+
+  addOutputOptions(keepalive.command("status").description("Show whether the keepalive launch agent is installed.")).action(
+    async (options: OutputCommandOptions) => {
+      const result = await keepaliveStatus(io.homeDir);
+      runtime.output(result, () => (result.installed ? `Keepalive installed (${result.plist_path})` : "Keepalive not installed"), options);
+    },
+  );
 
   addOutputOptions(program.command("update").description("Check for updates and upgrade the installed CLI."))
     .option("--check-only", "Only check for updates; do not install.")

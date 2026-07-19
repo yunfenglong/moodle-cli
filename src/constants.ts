@@ -27,12 +27,18 @@ export const FUNC_GET_POPUP_NOTIFICATIONS = "message_popup_get_popup_notificatio
 export const FUNC_GET_CONVERSATION_COUNTS = "core_message_get_conversation_counts";
 export const FUNC_GET_UNREAD_CONVERSATION_COUNTS = "core_message_get_unread_conversation_counts";
 export const FUNC_GET_DISCUSSION_POSTS = "mod_forum_get_discussion_posts";
+export const FUNC_SESSION_TOUCH = "core_session_touch";
+export const FUNC_SESSION_TIME_REMAINING = "core_session_time_remaining";
 
 export const CONFIG_FILENAME = "config.yaml";
 export const CONFIG_DIR_NAME = ".config/moodle-cli";
 export const CACHE_DIR_NAME = ".cache/moodle-cli";
 export const SESSION_CACHE_FILENAME = "session.json";
-export const DEFAULT_SESSION_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+export const DEFAULT_SESSION_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+export const KEEPALIVE_LAUNCH_AGENT_LABEL = "com.moodle-cli.keepalive";
+export const KEEPALIVE_DEFAULT_INTERVAL_MINUTES = 30;
+export const KEEPALIVE_LOG_FILENAME = "keepalive.log";
 
 export const ENV_MOODLE_SESSION = "MOODLE_SESSION";
 export const ENV_MOODLE_BASE_URL = "MOODLE_BASE_URL";

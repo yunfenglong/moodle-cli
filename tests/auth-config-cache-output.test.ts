@@ -26,6 +26,7 @@ describe("auth chain", () => {
 
     const session = await getAuthenticatedSession(BASE_URL, {
       env: { [ENV_MOODLE_SESSION]: "env-cookie" },
+      homeDir: await mkdtemp(join(tmpdir(), "moodle-cli-auth-chain-")),
       validateSession,
       browserCookieProvider,
     });
@@ -208,6 +209,7 @@ describe("agent output contract", () => {
     const stderr = buffer();
     const code = await runCli(["node", "moodle", "user", "--fields", "userid,fullname"], {
       env: { [ENV_MOODLE_BASE_URL]: BASE_URL, [ENV_MOODLE_SESSION]: "cookie" },
+      homeDir: await mkdtemp(join(tmpdir(), "moodle-cli-json-pipe-")),
       fetchImpl,
       stdout,
       stderr,
