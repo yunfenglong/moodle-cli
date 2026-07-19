@@ -57,6 +57,19 @@ base_url: https://school.example.edu
 
 Use a root URL only, not `/login/index.php` or `/my/`.
 
+### Session Keepalive
+
+Moodle expires idle sessions server-side, which normally forces a fresh SSO login. The CLI can renew the session in the background instead:
+
+```bash
+moodle auth status               # cache freshness + server session state
+moodle auth keepalive            # renew once; re-login from browser/okta cookies if expired
+moodle auth keepalive install    # macOS launch agent, renews every 30 min
+moodle auth login                # force a fresh login
+```
+
+On Linux, add a cron entry: `*/30 * * * * moodle auth keepalive --json`.
+
 ## Usage
 
 ```bash

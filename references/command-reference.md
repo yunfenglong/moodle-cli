@@ -7,6 +7,13 @@ Read this file for exact arguments, flags, and defaults after selecting a branch
 | moodle activities | List activities in a course. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle alerts | List notifications and message counts. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
 | moodle assign | Show assignment details. | <assign> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth | Session and keepalive utilities. |  |  |
+| moodle auth keepalive | Renew the Moodle session once; used by the background keepalive agent. |  | --no-renew<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth keepalive install | Install a macOS launch agent that renews the session periodically. |  | --interval (value required)<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth keepalive status | Show whether the keepalive launch agent is installed. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth keepalive uninstall | Remove the keepalive launch agent. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth login | Force a fresh login and refresh the session cache. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth status | Show cached session freshness and keepalive state. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle course | Show course detail with sections. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle courses | List enrolled courses. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle folder | Show folder details. | <folder> | --json<br>--yaml<br>--table<br>--fields (value required) |

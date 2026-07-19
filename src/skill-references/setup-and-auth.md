@@ -50,9 +50,24 @@ moodle user --json
 
 Setup is complete when this returns the authenticated Moodle user.
 
+## Keep the Session Alive
+
+Moodle expires idle sessions server-side (often a few hours). To avoid re-running SSO logins:
+
+```bash
+moodle auth status --json              # cache freshness + server session state
+moodle auth keepalive --json           # renew once (re-login from browser/okta cookies if expired)
+moodle auth keepalive install          # macOS launch agent, renews every 30 min
+moodle auth keepalive install --interval 15
+moodle auth keepalive uninstall
+moodle auth login --json               # force a fresh login and refresh the cache
+```
+
+On Linux, schedule `moodle auth keepalive --json` with cron instead of `install`.
+
 ## Recover Failures
 
 - **No usable MoodleSession**: sign in to Moodle in a supported browser and retry; otherwise configure `okta-auth-cli` or provide `MOODLE_SESSION` through the environment.
 - **Configured site is wrong**: correct `MOODLE_BASE_URL` or the saved `base_url`, then rerun `moodle user --json`.
-- **Cached session expired**: rerun with `--no-cache` once so the CLI reacquires a session.
+- **Cached session expired**: run `moodle auth login`, or rerun with `--no-cache` once so the CLI reacquires a session.
 - **Non-interactive config error**: set `MOODLE_BASE_URL`; a pipe cannot answer the first-run prompt.
