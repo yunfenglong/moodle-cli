@@ -141,19 +141,33 @@ export class MoodleClient {
 
   async getSiteInfo(): Promise<UserInfo> {
     await this.ensureSession();
-    const data = await this.call(FUNC_GET_SITE_INFO);
-    if (!isRecord(data) || !("userid" in data)) {
-      if (this.userInfo) {
-        return this.userInfo;
+    try {
+      const data = await this.call(FUNC_GET_SITE_INFO);
+      if (isRecord(data) && "userid" in data) {
+        const info = parseUserInfo(data);
+        this.sesskey = typeof data.sesskey === "string" ? data.sesskey : this.sesskey;
+        this.userid = info.userid;
+        this.userInfo = info;
+        await this.writeCache();
+        return info;
       }
-      throw new NotFoundError("Session appears invalid: could not retrieve user info");
+    } catch (error) {
+      if (!(error instanceof MoodleAPIError) || error.moodleErrorCode !== "servicenotavailable") {
+        throw error;
+      }
     }
-    const info = parseUserInfo(data);
-    this.sesskey = typeof data.sesskey === "string" ? data.sesskey : this.sesskey;
-    this.userid = info.userid;
-    this.userInfo = info;
+    // Sites like Monash disable core_webservice_get_site_info; scrape the dashboard instead.
+    if (this.userInfo?.fullname) {
+      return this.userInfo;
+    }
+    const html = await this.get(DASHBOARD_PATH);
+    const context = parsePageContext(html, this.baseUrl);
+    if (!context.user_info.fullname && this.userInfo) {
+      return this.userInfo;
+    }
+    this.applyContext(context);
     await this.writeCache();
-    return info;
+    return context.user_info;
   }
 
   async getCourses(): Promise<Course[]> {
