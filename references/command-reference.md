@@ -5,7 +5,7 @@ Read this file for exact arguments, flags, and defaults after selecting a branch
 | Command | Description | Arguments | Flags |
 | --- | --- | --- | --- |
 | moodle activities | List activities in a course. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle alerts | List notifications and message counts. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
+| moodle alerts | List notifications and message counts. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required)<br>--mark-read |
 | moodle assign | Show assignment details. | <assign> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle auth | Session and keepalive utilities. |  |  |
 | moodle auth keepalive | Renew the Moodle session once; used by the background keepalive agent. |  | --no-renew<br>--json<br>--yaml<br>--table<br>--fields (value required) |
@@ -14,8 +14,14 @@ Read this file for exact arguments, flags, and defaults after selecting a branch
 | moodle auth keepalive uninstall | Remove the keepalive launch agent. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle auth login | Force a fresh login and refresh the session cache. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle auth status | Show cached session freshness and keepalive state. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle calendar | Show calendar events (upcoming by default). |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--month (value required)<br>--course (value required)<br>--ics (value required) |
+| moodle choice | Show a choice activity, or vote with --answer. | <choice> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--answer (value required) |
+| moodle complete | Manually mark an activity as complete. | <activity> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--undo |
 | moodle course | Show course detail with sections. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle courses | List enrolled courses. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle download | Download files from a resource, folder, or whole course. | [target] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--dir (default: .; value required)<br>--force<br>--dry-run |
+| moodle export | Export course pages, links, and files to a local directory. | <course> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--dir (default: .; value required)<br>--force |
+| moodle feedback | List feedback questions, or fill it in with --answer. | <feedback> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--answer (value required) |
 | moodle folder | Show folder details. | <folder> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle forum | Forum utilities. |  |  |
 | moodle forum check | Validate discussion rendering. | <forum> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
@@ -24,15 +30,18 @@ Read this file for exact arguments, flags, and defaults after selecting a branch
 | moodle forum find | Find the best forum match. | <query> | --list<br>--body<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--forum (value required)<br>--titles-only<br>--unread-only<br>--recent<br>--limit-forums (value required)<br>--limit-discussions (value required)<br>--limit (default: 5; value required) |
 | moodle forum forums | List forum activities. | [query] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--limit (default: 50; value required) |
 | moodle forum search | Search forum discussion titles and post text. | <query> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--forum (value required)<br>--titles-only<br>--unread-only<br>--recent<br>--limit-forums (value required)<br>--limit-discussions (value required)<br>--limit (default: 20; value required) |
-| moodle grades | Show grade details for a course. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle grades | Show grade details for a course, or an all-course overview. | [course] | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle link | Show link details. | <link> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle messages | List message conversations, or show one conversation. | [conversation] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
 | moodle overview | Show a compact multi-source overview. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--todo-limit (default: 5; value required)<br>--todo-days (value required)<br>--alerts-limit (default: 5; value required) |
 | moodle page | Show page details. | <page> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle quiz | Show quiz details. | <quiz> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle resource | Show resource details. | <resource> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle search | Search activity and section names/descriptions across courses. | <query> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--limit (default: 20; value required) |
 | moodle skills | Show skill metadata or delegate to the shared skills CLI. |  |  |
 | moodle skills add | Install the published skill through npx skills add. |  |  |
 | moodle skills generate | Regenerate the agent skill bundle from the CLI command tree. |  |  |
+| moodle submit | Upload files to an assignment submission (saves the submission; add --submit to lock it in for grading). | <assign> <files...> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--submit<br>--confirm |
 | moodle todo | List upcoming actionable timeline items. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required)<br>--days (value required) |
 | moodle update | Check for updates and upgrade the installed CLI. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--check-only |
 | moodle user | Show authenticated user info. |  | --json<br>--yaml<br>--table<br>--fields (value required) |

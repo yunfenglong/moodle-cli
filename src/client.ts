@@ -6,13 +6,20 @@ import {
   DASHBOARD_PATH,
   FOLDER_VIEW_PATH,
   FUNC_GET_ACTION_EVENTS,
+  FUNC_GET_CALENDAR_MONTHLY,
+  FUNC_GET_CALENDAR_UPCOMING,
+  FUNC_GET_CONVERSATIONS,
   FUNC_GET_CONVERSATION_COUNTS,
+  FUNC_GET_CONVERSATION_MESSAGES,
   FUNC_GET_COURSE_CONTENTS,
   FUNC_GET_COURSES,
   FUNC_GET_COURSES_BY_TIMELINE,
+  FUNC_GET_GRADE_OVERVIEW,
   FUNC_GET_POPUP_NOTIFICATIONS,
   FUNC_GET_SITE_INFO,
   FUNC_GET_UNREAD_CONVERSATION_COUNTS,
+  FUNC_MARK_ALL_NOTIFICATIONS_READ,
+  FUNC_UPDATE_COMPLETION,
   GRADE_REPORT_INDEX_PATH,
   GRADE_REPORT_OVERVIEW_PATH,
   GRADE_REPORT_PATH,
@@ -28,6 +35,9 @@ import { searchForumContent as searchForumModule } from "./forum-search.js";
 import type {
   AlertSummary,
   Assignment,
+  CalendarEvent,
+  Conversation,
+  ConversationDetail,
   Course,
   CourseGrades,
   Folder,
@@ -35,6 +45,7 @@ import type {
   ForumDiscussion,
   ForumDiscussionRef,
   ForumSearchHit,
+  GradeOverviewRow,
   Link,
   Overview,
   Page,
@@ -47,19 +58,25 @@ import type {
 } from "./models.js";
 import {
   parseAlertSummary,
+  parseCalendarEvents,
+  parseConversationDetail,
+  parseConversations,
   parseCourseContents,
   parseCourses,
+  parseGradeOverviewGrades,
   parseTodoItems,
   parseUserInfo,
 } from "./parsers.js";
 import {
   hasCourseGradesHtml,
   parseAssignmentHtml,
+  parseAssignmentSubmissionFiles,
   parseCourseContentsHtml,
   parseCourseGradesHtml,
   parseCourseGradesUrl,
   parseCourseIdFromPageHtml,
   parseCourseSectionNumbers,
+  parseFolderFileLinks,
   parseFolderHtml,
   parseGradeOverviewRows,
   parseLinkHtml,
@@ -339,6 +356,118 @@ export class MoodleClient {
     };
   }
 
+  async getCalendarUpcoming(courseId?: number): Promise<CalendarEvent[]> {
+    await this.ensureSession();
+    const data = await this.call(FUNC_GET_CALENDAR_UPCOMING, { courseid: courseId ?? 1 });
+    const events = parseCalendarEvents(isRecord(data) ? data.events : []);
+    return events.sort((a, b) => a.starts_at - b.starts_at);
+  }
+
+  async getCalendarMonth(year: number, month: number, courseId?: number): Promise<CalendarEvent[]> {
+    await this.ensureSession();
+    const data = await this.call(FUNC_GET_CALENDAR_MONTHLY, {
+      year,
+      month,
+      courseid: courseId ?? 1,
+      categoryid: 0,
+      includenavigation: false,
+      mini: true,
+      day: 1,
+    });
+    const events: unknown[] = [];
+    const seen = new Set<number>();
+    const weeks = isRecord(data) ? asUnknownArray(data.weeks) : [];
+    for (const week of weeks) {
+      if (!isRecord(week)) {
+        continue;
+      }
+      for (const day of asUnknownArray(week.days)) {
+        if (!isRecord(day)) {
+          continue;
+        }
+        for (const event of asUnknownArray(day.events)) {
+          const id = isRecord(event) && typeof event.id === "number" ? event.id : 0;
+          if (id && seen.has(id)) {
+            continue;
+          }
+          if (id) {
+            seen.add(id);
+          }
+          events.push(event);
+        }
+      }
+    }
+    return parseCalendarEvents(events).sort((a, b) => a.starts_at - b.starts_at);
+  }
+
+  async getAssignmentSubmissionFiles(id: number): Promise<Array<{ name: string; url: string }>> {
+    return parseAssignmentSubmissionFiles(await this.get(ASSIGN_VIEW_PATH, { id }), this.baseUrl);
+  }
+
+  async getGradesOverview(): Promise<GradeOverviewRow[]> {
+    await this.ensureSession();
+    try {
+      const data = await this.call(FUNC_GET_GRADE_OVERVIEW, { userid: this.userid });
+      if (isRecord(data) && Array.isArray(data.grades) && data.grades.length) {
+        const courses = await this.getCourses();
+        const names = new Map(courses.map((course) => [course.id, course.fullname || course.shortname]));
+        return parseGradeOverviewGrades(data, names, this.baseUrl);
+      }
+    } catch (error) {
+      if (!(error instanceof MoodleAPIError) || error.moodleErrorCode !== "servicenotavailable") {
+        throw error;
+      }
+    }
+    const html = await this.get(GRADE_REPORT_OVERVIEW_PATH);
+    const rows = parseGradeOverviewRows(html, this.baseUrl);
+    return Object.entries(rows).map(([courseId, row]) => ({
+      course_id: Number(courseId),
+      course_name: row.course_name,
+      grade: row.grade,
+      url: row.url,
+    }));
+  }
+
+  async getConversations(limit = 20): Promise<Conversation[]> {
+    await this.ensureSession();
+    const data = await this.call(FUNC_GET_CONVERSATIONS, { userid: this.userid, limitfrom: 0, limitnum: limit });
+    return parseConversations(data, this.userid ?? 0, this.baseUrl);
+  }
+
+  async getConversationMessages(conversationId: number, limit = 20): Promise<ConversationDetail> {
+    await this.ensureSession();
+    const data = await this.call(FUNC_GET_CONVERSATION_MESSAGES, {
+      currentuserid: this.userid,
+      convid: conversationId,
+      limitfrom: 0,
+      limitnum: limit,
+      newest: true,
+    });
+    return parseConversationDetail(data, conversationId, this.userid ?? 0, this.baseUrl);
+  }
+
+  async downloadBinary(url: string): Promise<{ bytes: Uint8Array; filename: string; contentType: string; finalUrl: string }> {
+    const response = await this.fetchImpl(url, { headers: { cookie: `${this.cookie.name}=${this.cookie.value}` }, redirect: "follow" });
+    if (response.url.includes("/login/") && this.onLoginRequired && !this.retryingLogin) {
+      await this.reauthenticate();
+      return this.downloadBinary(url);
+    }
+    if (!response.ok) {
+      throw new MoodleAPIError(`HTTP ${response.status} loading ${url}`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return {
+      bytes,
+      filename: filenameFromResponse(response.headers.get("content-disposition"), response.url || url),
+      contentType: response.headers.get("content-type") ?? "",
+      finalUrl: response.url || url,
+    };
+  }
+
+  async getFolderFiles(folderId: number): Promise<Array<{ name: string; url: string }>> {
+    return parseFolderFileLinks(await this.get(FOLDER_VIEW_PATH, { id: folderId }), this.baseUrl);
+  }
+
   async getAssignment(id: number): Promise<Assignment> {
     return parseAssignmentHtml(await this.get(ASSIGN_VIEW_PATH, { id }), id, this.baseUrl);
   }
@@ -396,6 +525,67 @@ export class MoodleClient {
   }): Promise<ForumSearchHit[]> {
     const { query, ...searchOptions } = options;
     return searchForumModule(this.forum, query, { ...searchOptions, baseUrl: this.baseUrl });
+  }
+
+  async markActivityCompletion(cmid: number, completed: boolean): Promise<boolean> {
+    await this.ensureSession();
+    const data = await this.call(FUNC_UPDATE_COMPLETION, { cmid, completed });
+    return isRecord(data) ? Boolean(data.status) : false;
+  }
+
+  async markAllNotificationsRead(): Promise<void> {
+    await this.ensureSession();
+    await this.call(FUNC_MARK_ALL_NOTIFICATIONS_READ, { useridto: this.userid });
+  }
+
+  async getSesskey(): Promise<string> {
+    await this.ensureSession();
+    return this.sesskey ?? "";
+  }
+
+  async getHtml(pathname: string, params: Record<string, string | number> = {}): Promise<string> {
+    await this.ensureSession();
+    return this.get(pathname, params);
+  }
+
+  async postFormUrlencoded(url: string, fields: Record<string, string | string[]>): Promise<string> {
+    await this.ensureSession();
+    const body = new URLSearchParams();
+    for (const [key, value] of Object.entries(fields)) {
+      for (const item of Array.isArray(value) ? value : [value]) {
+        body.append(key, item);
+      }
+    }
+    const response = await this.fetchImpl(url, {
+      method: "POST",
+      headers: {
+        cookie: `${this.cookie.name}=${this.cookie.value}`,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: body.toString(),
+      redirect: "follow",
+    });
+    if (response.url.includes("/login/")) {
+      throw new MoodleAPIError("Session expired while posting a form", "servicerequireslogin");
+    }
+    if (!response.ok) {
+      throw new MoodleAPIError(`HTTP ${response.status} posting to ${url}`);
+    }
+    return response.text();
+  }
+
+  async postMultipartJson(url: string, form: FormData): Promise<unknown> {
+    await this.ensureSession();
+    const response = await this.fetchImpl(url, {
+      method: "POST",
+      headers: { cookie: `${this.cookie.name}=${this.cookie.value}` },
+      body: form,
+      redirect: "follow",
+    });
+    if (!response.ok) {
+      throw new MoodleAPIError(`HTTP ${response.status} posting to ${url}`);
+    }
+    return response.json();
   }
 
   async callBatch(requests: AjaxCall[]): Promise<AjaxBatchResult[]> {
@@ -611,4 +801,29 @@ function queryMatches(text: string, query: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function asUnknownArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function filenameFromResponse(contentDisposition: string | null, url: string): string {
+  const encoded = contentDisposition?.match(/filename\*=(?:UTF-8'')?([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded.trim().replace(/^"|"$/g, ""));
+    } catch {
+      // fall through to plain filename
+    }
+  }
+  const plain = contentDisposition?.match(/filename="?([^";]+)"?/i)?.[1];
+  if (plain) {
+    return plain.trim();
+  }
+  try {
+    const segment = new URL(url).pathname.split("/").filter(Boolean).at(-1) ?? "";
+    return decodeURIComponent(segment);
+  } catch {
+    return "";
+  }
 }

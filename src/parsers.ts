@@ -2,10 +2,15 @@ import type {
   Activity,
   AlertNotification,
   AlertSummary,
+  CalendarEvent,
+  Conversation,
+  ConversationDetail,
+  ConversationMessage,
   Course,
   ForumDiscussion,
   ForumPost,
   ForumPostAuthor,
+  GradeOverviewRow,
   Section,
   TodoItem,
   UserInfo,
@@ -162,6 +167,95 @@ export function parseAlertSummary(
     unread_direct_message_count: numberValue(unreadTypes["1"]),
     unread_group_message_count: numberValue(unreadTypes["2"]),
     unread_self_message_count: numberValue(unreadTypes["3"]),
+  };
+}
+
+export function parseCalendarEvent(value: unknown): CalendarEvent {
+  const data = asRecord(value);
+  const course = asRecord(data.course);
+  const start = numberValue(data.timestart);
+  const duration = numberValue(data.timeduration);
+  return {
+    id: numberValue(data.id),
+    name: stringValue(data.name),
+    description: htmlToStructuredContent(stringValue(data.description), "").text,
+    course_id: numberValue(course.id),
+    course_name: stringValue(course.fullname),
+    modname: stringValue(data.modulename),
+    event_type: stringValue(data.eventtype),
+    starts_at: start,
+    ends_at: duration > 0 ? start + duration : start,
+    location: stringValue(data.location),
+    url: stringValue(data.url) || stringValue(data.viewurl),
+  };
+}
+
+export function parseCalendarEvents(value: unknown): CalendarEvent[] {
+  return asArray(value).map((item) => parseCalendarEvent(item));
+}
+
+export function parseGradeOverviewGrades(value: unknown, courseNames: Map<number, string>, baseUrl: string): GradeOverviewRow[] {
+  const data = asRecord(value);
+  return asArray(data.grades)
+    .map((item) => {
+      const grade = asRecord(item);
+      const courseId = numberValue(grade.courseid);
+      return {
+        course_id: courseId,
+        course_name: courseNames.get(courseId) ?? "",
+        grade: stringValue(grade.grade),
+        url: courseId ? `${baseUrl.replace(/\/$/, "")}/course/user.php?mode=grade&id=${courseId}` : "",
+      };
+    })
+    .filter((row) => row.course_id > 0);
+}
+
+const CONVERSATION_TYPES: Record<number, string> = { 1: "direct", 2: "group", 3: "self" };
+
+export function parseConversations(value: unknown, currentUserId: number, baseUrl: string): Conversation[] {
+  const data = asRecord(value);
+  return asArray(data.conversations).map((item) => {
+    const conversation = asRecord(item);
+    const members = asArray(conversation.members).map((member) => asRecord(member));
+    const others = members.filter((member) => numberValue(member.id) !== currentUserId);
+    const lastMessage = asRecord(asArray(conversation.messages)[0]);
+    const senderId = numberValue(lastMessage.useridfrom);
+    return {
+      id: numberValue(conversation.id),
+      name: stringValue(conversation.name) || others.map((member) => stringValue(member.fullname)).filter(Boolean).join(", "),
+      type: CONVERSATION_TYPES[numberValue(conversation.type)] ?? String(conversation.type ?? ""),
+      member_count: numberValue(conversation.membercount),
+      unread_count: numberValue(conversation.unreadcount),
+      is_favourite: booleanValue(conversation.isfavourite),
+      last_message: htmlToStructuredContent(stringValue(lastMessage.text), baseUrl).text,
+      last_message_at: numberValue(lastMessage.timecreated),
+      last_sender: senderId === currentUserId ? "me" : stringValue(members.find((member) => numberValue(member.id) === senderId)?.fullname),
+    };
+  });
+}
+
+export function parseConversationDetail(value: unknown, conversationId: number, currentUserId: number, baseUrl: string): ConversationDetail {
+  const data = asRecord(value);
+  const members = asArray(data.members).map((member) => asRecord(member));
+  const names = new Map(members.map((member) => [numberValue(member.id), stringValue(member.fullname)]));
+  const messages: ConversationMessage[] = asArray(data.messages)
+    .map((item) => {
+      const message = asRecord(item);
+      const senderId = numberValue(message.useridfrom);
+      return {
+        id: numberValue(message.id),
+        sender_id: senderId,
+        sender_name: senderId === currentUserId ? "me" : names.get(senderId) ?? "",
+        text: htmlToStructuredContent(stringValue(message.text), baseUrl).text,
+        sent_at: numberValue(message.timecreated),
+      };
+    })
+    .sort((a, b) => a.sent_at - b.sent_at);
+  return {
+    id: numberValue(data.id) || conversationId,
+    name: stringValue(data.name) || members.filter((member) => numberValue(member.id) !== currentUserId).map((member) => stringValue(member.fullname)).filter(Boolean).join(", "),
+    member_count: members.length,
+    messages,
   };
 }
 

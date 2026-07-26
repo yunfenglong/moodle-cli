@@ -236,8 +236,25 @@ export function parseAssignmentHtml(html: string, assignmentId: number, baseUrl:
     grading_status: findTableValue(html, "Grading status"),
     time_remaining: findTableValue(html, "Time remaining"),
     grade: findTableValue(html, "Grade"),
+    submission_files: parseAssignmentSubmissionFiles(html, baseUrl).map((file) => file.name),
     url: `${baseUrl.replace(/\/$/, "")}/mod/assign/view.php?id=${assignmentId}`,
   };
+}
+
+export function parseAssignmentSubmissionFiles(html: string, baseUrl: string): Array<{ name: string; url: string }> {
+  const root = parse(html);
+  const files: Array<{ name: string; url: string }> = [];
+  const seen = new Set<string>();
+  for (const link of root.querySelectorAll('table a[href*="pluginfile.php"]')) {
+    const name = cleanNodeText(link);
+    const url = resolveUrl(baseUrl, link.getAttribute("href") ?? "");
+    if (!name || !url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    files.push({ name, url });
+  }
+  return files;
 }
 
 export function parseQuizHtml(html: string, quizId: number, baseUrl: string): Quiz {
@@ -302,6 +319,71 @@ export function parseFolderHtml(html: string, folderId: number, baseUrl: string)
     files,
     url: `${baseUrl.replace(/\/$/, "")}/mod/folder/view.php?id=${folderId}`,
   };
+}
+
+export interface ScrapedForm {
+  action: string;
+  fields: Record<string, string>;
+}
+
+export function parseFormWithField(html: string, name: string, value: string, baseUrl: string): ScrapedForm | null {
+  const root = parse(html);
+  for (const form of root.querySelectorAll("form")) {
+    const marker = form.querySelector(`input[name="${name}"]`);
+    if (!marker || marker.getAttribute("value") !== value) {
+      continue;
+    }
+    const fields: Record<string, string> = {};
+    for (const input of form.querySelectorAll("input[type='hidden']")) {
+      const fieldName = input.getAttribute("name");
+      if (fieldName) {
+        fields[fieldName] = input.getAttribute("value") ?? "";
+      }
+    }
+    const action = form.getAttribute("action") ?? "";
+    return { action: action ? resolveUrl(baseUrl, action) : "", fields };
+  }
+  return null;
+}
+
+export function parseUploadRepositoryId(html: string): number {
+  const after = html.match(/"type":"upload"[^{}]*?"id":(\d+)/);
+  if (after) {
+    return Number(after[1]);
+  }
+  const before = html.match(/"id":(\d+)[^{}]*?"type":"upload"/);
+  return before ? Number(before[1]) : 0;
+}
+
+export function parseContextId(html: string): number {
+  const match = html.match(/"contextid":(\d+)/) ?? html.match(/"ctx_id":(\d+)/) ?? html.match(/"context":\{"id":(\d+)/);
+  return match ? Number(match[1]) : 0;
+}
+
+export function parseSubmissionStatement(html: string): string {
+  const root = parse(html);
+  const input = root.querySelector('input[name="submissionstatement"]');
+  if (!input) {
+    return "";
+  }
+  const container = input.parentNode as HTMLElement | null;
+  return cleanText(container?.textContent ?? "");
+}
+
+export function parseFolderFileLinks(html: string, baseUrl: string): Array<{ name: string; url: string }> {
+  const root = parse(html);
+  const files: Array<{ name: string; url: string }> = [];
+  const seen = new Set<string>();
+  for (const link of root.querySelectorAll(".foldertree a[href], .fp-filename-icon a[href]")) {
+    const name = cleanNodeText(link);
+    const url = resolveUrl(baseUrl, link.getAttribute("href") ?? "");
+    if (!name || !url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    files.push({ name, url });
+  }
+  return files;
 }
 
 export function parseForumDiscussionHtml(html: string, baseUrl: string, discussionId: number): ForumDiscussion {

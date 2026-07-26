@@ -115,6 +115,146 @@ export interface CourseGrades {
   items: GradeItem[];
 }
 
+export interface GradeOverviewRow {
+  course_id: number;
+  course_name: string;
+  grade: string;
+  url: string;
+}
+
+export interface Conversation {
+  id: number;
+  name: string;
+  type: string;
+  member_count: number;
+  unread_count: number;
+  is_favourite: boolean;
+  last_message: string;
+  last_message_at: number;
+  last_sender: string;
+}
+
+export interface ConversationMessage {
+  id: number;
+  sender_id: number;
+  sender_name: string;
+  text: string;
+  sent_at: number;
+}
+
+export interface ConversationDetail {
+  id: number;
+  name: string;
+  member_count: number;
+  messages: ConversationMessage[];
+}
+
+export interface CalendarEvent {
+  id: number;
+  name: string;
+  description: string;
+  course_id: number;
+  course_name: string;
+  modname: string;
+  event_type: string;
+  starts_at: number;
+  ends_at: number;
+  location: string;
+  url: string;
+}
+
+export interface CourseSearchHit {
+  course_id: number;
+  course_name: string;
+  section_name: string;
+  activity_id: number;
+  activity_name: string;
+  modname: string;
+  matched_in: string;
+  snippet: string;
+  url: string;
+}
+
+export interface CourseExportSummary {
+  course_id: number;
+  course_name: string;
+  dir: string;
+  sections: number;
+  pages: number;
+  links: number;
+  files: DownloadResult[];
+}
+
+export interface AssignSubmitResult {
+  assign_id: number;
+  uploaded: Array<{ file: string; bytes: number }>;
+  saved: boolean;
+  submitted_for_grading: boolean;
+  submission_status: string;
+  submission_statement: string;
+}
+
+export interface ChoiceOption {
+  id: number;
+  text: string;
+  selected: boolean;
+}
+
+export interface ChoiceInfo {
+  id: number;
+  name: string;
+  can_vote: boolean;
+  multiple: boolean;
+  options: ChoiceOption[];
+  url: string;
+}
+
+export interface FeedbackQuestion {
+  item_id: number;
+  name: string;
+  label: string;
+  type: string;
+  required: boolean;
+  options: Array<{ value: string; text: string }>;
+}
+
+export interface FeedbackInfo {
+  id: number;
+  name: string;
+  page: number;
+  has_more_pages: boolean;
+  questions: FeedbackQuestion[];
+  url: string;
+}
+
+export interface FeedbackSubmitResult {
+  id: number;
+  completed: boolean;
+  pages_submitted: number;
+  message: string;
+}
+
+export interface CompletionResult {
+  cmid: number;
+  completed: boolean;
+  updated: boolean;
+}
+
+export interface DownloadItem {
+  name: string;
+  url: string;
+  source: string;
+}
+
+export interface DownloadResult {
+  name: string;
+  file: string;
+  url: string;
+  bytes: number;
+  status: "downloaded" | "exists" | "planned" | "failed";
+  error?: string;
+}
+
 export interface Assignment {
   id: number;
   name: string;
@@ -126,6 +266,7 @@ export interface Assignment {
   grading_status: string;
   time_remaining: string;
   grade: string;
+  submission_files: string[];
   url: string;
 }
 

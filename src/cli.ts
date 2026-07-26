@@ -8,15 +8,27 @@ import {
   formatActivityDetail,
   formatActivityList,
   formatAlerts,
+  formatAssignSubmitResult,
   formatAuthStatus,
+  formatCalendarEvents,
+  formatChoice,
+  formatCompletionResult,
+  formatConversationDetail,
+  formatConversations,
+  formatCourseExport,
+  formatCourseSearchHits,
   formatCourseSections,
   formatCourses,
+  formatDownloadResults,
+  formatFeedbackInfo,
+  formatFeedbackResult,
   formatForumDiscussion,
   formatForumDiscussionRefs,
   formatForumActivities,
   formatForumSearchHits,
   formatForumCheckResults,
   formatGrades,
+  formatGradesOverview,
   formatKeepaliveResult,
   formatTodo,
   formatUser,
@@ -33,10 +45,18 @@ import {
 } from "./keepalive.js";
 import { getAuthenticatedSession, invalidateCachedSession } from "./auth.js";
 import { VERSION } from "./version.js";
-import { ASSIGN_VIEW_PATH, FOLDER_VIEW_PATH, PAGE_VIEW_PATH, QUIZ_VIEW_PATH, RESOURCE_VIEW_PATH, URL_VIEW_PATH } from "./constants.js";
+import { ASSIGN_VIEW_PATH, CHOICE_VIEW_PATH, FEEDBACK_VIEW_PATH, FOLDER_VIEW_PATH, PAGE_VIEW_PATH, QUIZ_VIEW_PATH, RESOURCE_VIEW_PATH, URL_VIEW_PATH } from "./constants.js";
 import { filterDiscussionToPost, parseDiscussionReference, parseForumReference } from "./forum.js";
 import { checkForumDiscussions } from "./forum-search.js";
 import { looksLikeUrl, parseActivityReference, resolveTopLevelUrl } from "./url-resolver.js";
+import { executeDownloads, planDownloads } from "./download.js";
+import { exportCourse } from "./export.js";
+import { submitAssignment } from "./assign-submit.js";
+import { getChoice, voteChoice } from "./choice.js";
+import { completeFeedback, getFeedback } from "./feedback.js";
+import { searchCourseContent } from "./course-search.js";
+import { eventsToIcs } from "./ics.js";
+import { writeFile } from "node:fs/promises";
 
 interface CliIO {
   stdout?: NodeJS.WriteStream | { write(chunk: string): boolean };
@@ -136,9 +156,15 @@ export function buildProgram(io: CliIO = {}): Command {
 
   addOutputOptions(program.command("alerts").description("List notifications and message counts."))
     .option("--limit <number>", "Maximum number of notifications.", parsePositiveInt, 20)
-    .action(async (options: OutputCommandOptions & { limit: number }) => {
-      const alerts = await (await runtime.getClient()).getAlerts(options.limit);
-      runtime.output(alerts, () => formatAlerts(alerts), options);
+    .option("--mark-read", "Mark all notifications as read after listing.")
+    .action(async (options: OutputCommandOptions & { limit: number; markRead?: boolean }) => {
+      const client = await runtime.getClient();
+      const alerts = await client.getAlerts(options.limit);
+      if (options.markRead) {
+        await client.markAllNotificationsRead();
+      }
+      const data = options.markRead ? { ...alerts, marked_read: true } : alerts;
+      runtime.output(data, () => `${formatAlerts(alerts)}${options.markRead ? "\nMarked all notifications as read" : ""}`, options);
     });
 
   addOutputOptions(program.command("overview").description("Show a compact multi-source overview."))
@@ -153,14 +179,88 @@ export function buildProgram(io: CliIO = {}): Command {
   addCourseCommand(program, runtime, "course", "Show course detail with sections.", async (client, courseId) => client.getCourseContents(courseId), formatCourseSections);
   addCourseCommand(program, runtime, "activities", "List activities in a course.", async (client, courseId) => client.getActivities(courseId), formatActivityList);
 
-  addOutputOptions(program.command("grades").description("Show grade details for a course.").argument("<course>", "Course ID or unique name")).action(
-    async (course: string, options: OutputCommandOptions) => {
+  addOutputOptions(program.command("grades").description("Show grade details for a course, or an all-course overview.").argument("[course]", "Course ID or unique name; omit for an overview of all courses")).action(
+    async (course: string | undefined, options: OutputCommandOptions) => {
       const client = await runtime.getClient();
+      if (!course) {
+        const overview = await client.getGradesOverview();
+        runtime.output(overview, () => formatGradesOverview(overview), options);
+        return;
+      }
       const courseId = await client.resolveCourseReference(course);
       const grades = await client.getCourseGrades(courseId);
       runtime.output(grades, () => formatGrades(grades), options);
     },
   );
+
+  addOutputOptions(program.command("messages").description("List message conversations, or show one conversation.").argument("[conversation]", "Conversation ID"))
+    .option("--limit <number>", "Maximum number of conversations or messages.", parsePositiveInt, 20)
+    .action(async (conversation: string | undefined, options: OutputCommandOptions & { limit: number }) => {
+      const client = await runtime.getClient();
+      if (conversation) {
+        const detail = await client.getConversationMessages(parsePositiveInt(conversation), options.limit);
+        runtime.output(detail, () => formatConversationDetail(detail), options);
+        return;
+      }
+      const conversations = await client.getConversations(options.limit);
+      runtime.output(conversations, () => formatConversations(conversations), options);
+    });
+
+  addOutputOptions(program.command("download").description("Download files from a resource, folder, or whole course.").argument("[target]", "Resource/folder ID or URL, or a direct file URL"))
+    .option("--course <course>", "Download all resource and folder files in a course.")
+    .option("--dir <dir>", "Destination directory.", ".")
+    .option("--force", "Overwrite existing files.")
+    .option("--dry-run", "List what would be downloaded without downloading.")
+    .action(async (target: string | undefined, options: OutputCommandOptions & { course?: string; dir: string; force?: boolean; dryRun?: boolean }) => {
+      const client = await runtime.getClient();
+      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
+      const plans = await planDownloads(client, target, courseId);
+      const results = await executeDownloads(client, plans, { dir: options.dir, force: options.force, dryRun: options.dryRun });
+      runtime.output(results, () => formatDownloadResults(results), options);
+    });
+
+  addOutputOptions(program.command("calendar").description("Show calendar events (upcoming by default)."))
+    .option("--month <month>", "Show a specific month as YYYY-MM.")
+    .option("--course <course>", "Restrict to a course ID or unique course name match.")
+    .option("--ics <file>", "Also write the events to an ICS calendar file.")
+    .action(async (options: OutputCommandOptions & { month?: string; course?: string; ics?: string }) => {
+      const client = await runtime.getClient();
+      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
+      let events;
+      if (options.month) {
+        const match = options.month.match(/^(\d{4})-(\d{1,2})$/);
+        if (!match || Number(match[2]) < 1 || Number(match[2]) > 12) {
+          throw new UsageError("--month expects YYYY-MM.");
+        }
+        events = await client.getCalendarMonth(Number(match[1]), Number(match[2]), courseId);
+      } else {
+        events = await client.getCalendarUpcoming(courseId);
+      }
+      if (options.ics) {
+        await writeFile(options.ics, eventsToIcs(events));
+      }
+      runtime.output(events, () => `${formatCalendarEvents(events)}${options.ics ? `\nWrote ${events.length} events to ${options.ics}` : ""}`, options);
+    });
+
+  addOutputOptions(program.command("search").description("Search activity and section names/descriptions across courses.").argument("<query>", "Search query"))
+    .option("--course <course>", "Restrict to a course ID or unique course name match.")
+    .option("--limit <number>", "Maximum number of matches.", parsePositiveInt, 20)
+    .action(async (query: string, options: OutputCommandOptions & { course?: string; limit: number }) => {
+      const client = await runtime.getClient();
+      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
+      const hits = await searchCourseContent(client, query, { courseId, limit: options.limit });
+      runtime.output(hits, () => formatCourseSearchHits(hits), options);
+    });
+
+  addOutputOptions(program.command("export").description("Export course pages, links, and files to a local directory.").argument("<course>", "Course ID or unique name"))
+    .option("--dir <dir>", "Destination directory.", ".")
+    .option("--force", "Overwrite existing files.")
+    .action(async (course: string, options: OutputCommandOptions & { dir: string; force?: boolean }) => {
+      const client = await runtime.getClient();
+      const courseId = await client.resolveCourseReference(course);
+      const summary = await exportCourse(client, courseId, { dir: options.dir, force: options.force });
+      runtime.output(summary, () => formatCourseExport(summary), options);
+    });
 
   addActivityCommand(program, runtime, "assign", "Assignment", ASSIGN_VIEW_PATH, (client, id) => client.getAssignment(id));
   addActivityCommand(program, runtime, "quiz", "Quiz", QUIZ_VIEW_PATH, (client, id) => client.getQuiz(id));
@@ -168,6 +268,73 @@ export function buildProgram(io: CliIO = {}): Command {
   addActivityCommand(program, runtime, "link", "Link", URL_VIEW_PATH, (client, id) => client.getLink(id));
   addActivityCommand(program, runtime, "page", "Page", PAGE_VIEW_PATH, (client, id) => client.getPage(id));
   addActivityCommand(program, runtime, "folder", "Folder", FOLDER_VIEW_PATH, (client, id) => client.getFolder(id));
+
+  addOutputOptions(
+    program
+      .command("submit")
+      .description("Upload files to an assignment submission (saves the submission; add --submit to lock it in for grading).")
+      .argument("<assign>", "Assignment ID or URL")
+      .argument("<files...>", "Files to upload"),
+  )
+    .option("--submit", "Also submit for grading. This locks the submission and cannot be undone.")
+    .option("--confirm", "Required with --submit to confirm the lock step.")
+    .action(async (assign: string, files: string[], options: OutputCommandOptions & { submit?: boolean; confirm?: boolean }) => {
+      if (options.submit && !options.confirm) {
+        throw new UsageError("--submit permanently locks the submission for grading. Add --confirm to proceed.");
+      }
+      const id = parseActivityReference(assign, "Assignment", ASSIGN_VIEW_PATH);
+      const client = await runtime.getClient();
+      const result = await submitAssignment(client, id, files, { finalize: Boolean(options.submit && options.confirm) });
+      runtime.output(result, () => formatAssignSubmitResult(result), options);
+    });
+
+  addOutputOptions(program.command("choice").description("Show a choice activity, or vote with --answer.").argument("<choice>", "Choice ID or URL"))
+    .option("--answer <option...>", "Option ID(s) to vote for (see the listed option IDs).")
+    .action(async (choice: string, options: OutputCommandOptions & { answer?: string[] }) => {
+      const id = parseActivityReference(choice, "Choice", CHOICE_VIEW_PATH);
+      const client = await runtime.getClient();
+      if (!options.answer?.length) {
+        const info = await getChoice(client, id);
+        runtime.output(info, () => formatChoice(info), options);
+        return;
+      }
+      const answers = options.answer.map((value) => parsePositiveInt(value));
+      const info = await voteChoice(client, id, answers);
+      runtime.output(info, () => `Vote saved\n${formatChoice(info)}`, options);
+    });
+
+  addOutputOptions(program.command("feedback").description("List feedback questions, or fill it in with --answer.").argument("<feedback>", "Feedback ID or URL"))
+    .option("--answer <pair...>", "Answers as <questionId>=<value> (repeatable).")
+    .action(async (feedback: string, options: OutputCommandOptions & { answer?: string[] }) => {
+      const id = parseActivityReference(feedback, "Feedback", FEEDBACK_VIEW_PATH);
+      const client = await runtime.getClient();
+      if (!options.answer?.length) {
+        const info = await getFeedback(client, id);
+        runtime.output(info, () => formatFeedbackInfo(info), options);
+        return;
+      }
+      const answers: Record<number, string> = {};
+      for (const pair of options.answer) {
+        const match = pair.match(/^(\d+)=([\s\S]*)$/);
+        if (!match) {
+          throw new UsageError(`--answer expects <questionId>=<value>, got '${pair}'.`);
+        }
+        answers[Number(match[1])] = match[2];
+      }
+      const result = await completeFeedback(client, id, answers);
+      runtime.output(result, () => formatFeedbackResult(result), options);
+    });
+
+  addOutputOptions(program.command("complete").description("Manually mark an activity as complete.").argument("<activity>", "Activity (course module) ID or URL"))
+    .option("--undo", "Mark as not complete instead.")
+    .action(async (activity: string, options: OutputCommandOptions & { undo?: boolean }) => {
+      const cmid = parseCmidReference(activity);
+      const client = await runtime.getClient();
+      const completed = !options.undo;
+      const updated = await client.markActivityCompletion(cmid, completed);
+      const result = { cmid, completed, updated };
+      runtime.output(result, () => formatCompletionResult(result), options);
+    });
 
   const forum = program.command("forum").description("Forum utilities.");
   addOutputOptions(forum.command("discussion").description("Show posts in a forum discussion.").argument("<discussion>", "Discussion ID or URL"))
@@ -497,6 +664,22 @@ function outputFormat(options: OutputCommandOptions, stdout: CliIO["stdout"]): O
     return "table";
   }
   return "isTTY" in (stdout as NodeJS.WriteStream) && (stdout as NodeJS.WriteStream).isTTY ? "table" : "json";
+}
+
+function parseCmidReference(value: string): number {
+  const raw = value.trim();
+  if (/^\d+$/.test(raw)) {
+    return Number(raw);
+  }
+  try {
+    const id = new URL(raw).searchParams.get("id");
+    if (id && /^\d+$/.test(id)) {
+      return Number(id);
+    }
+  } catch {
+    // not a URL
+  }
+  throw new UsageError("Activity must be a course module ID or an activity view.php?id=... URL.");
 }
 
 function parsePositiveInt(value: string): number {

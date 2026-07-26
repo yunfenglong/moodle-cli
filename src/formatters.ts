@@ -2,13 +2,25 @@ import type {
   Activity,
   ActivityDetail,
   AlertSummary,
+  AssignSubmitResult,
+  CalendarEvent,
+  ChoiceInfo,
+  CompletionResult,
+  Conversation,
+  ConversationDetail,
   Course,
+  CourseExportSummary,
   CourseGrades,
+  CourseSearchHit,
+  DownloadResult,
+  FeedbackInfo,
+  FeedbackSubmitResult,
   ForumActivityRef,
   ForumCheckResult,
   ForumDiscussion,
   ForumDiscussionRef,
   ForumSearchHit,
+  GradeOverviewRow,
   Section,
   TodoItem,
   UserInfo,
@@ -86,6 +98,169 @@ export function formatGrades(grades: CourseGrades): string {
     ["Item", "Grade", "Range", "Percent", "Feedback"],
     ...grades.items.map((item) => [item.name, item.grade, item.range, item.percentage, item.feedback]),
   ]);
+}
+
+export function formatAssignSubmitResult(result: AssignSubmitResult): string {
+  const lines = result.uploaded.map((file) => `Uploaded ${file.file} (${formatBytes(file.bytes)})`);
+  lines.push(result.submitted_for_grading ? "Submitted for grading (locked)" : "Submission saved");
+  if (result.submission_statement) {
+    lines.push(`Accepted statement: ${result.submission_statement}`);
+  }
+  if (result.submission_status) {
+    lines.push(`Status: ${result.submission_status}`);
+  }
+  return lines.join("\n");
+}
+
+export function formatChoice(info: ChoiceInfo): string {
+  const lines = [`Choice ${info.id}${info.name ? `: ${info.name}` : ""}`];
+  lines.push(info.can_vote ? `Voting open${info.multiple ? " (multiple answers allowed)" : ""}` : "Voting not available");
+  for (const option of info.options) {
+    lines.push(`${option.selected ? "*" : "-"} ${option.id}  ${option.text}`);
+  }
+  if (!info.options.length) {
+    lines.push("No options visible");
+  }
+  return lines.join("\n");
+}
+
+export function formatFeedbackInfo(info: FeedbackInfo): string {
+  const lines = [`Feedback ${info.id}${info.name ? `: ${info.name}` : ""}`];
+  if (!info.questions.length) {
+    lines.push("No questions visible (closed or already completed)");
+    return lines.join("\n");
+  }
+  for (const question of info.questions) {
+    lines.push(`${question.item_id}  [${question.type}]${question.required ? " (required)" : ""}  ${question.label}`);
+    for (const option of question.options) {
+      lines.push(`     ${option.value}: ${option.text}`);
+    }
+  }
+  if (info.has_more_pages) {
+    lines.push("(more pages follow; answer with --answer <id>=<value> to progress through them)");
+  }
+  return lines.join("\n");
+}
+
+export function formatFeedbackResult(result: FeedbackSubmitResult): string {
+  return `Feedback ${result.id} completed (${result.pages_submitted} page${result.pages_submitted === 1 ? "" : "s"}): ${result.message}`;
+}
+
+export function formatCompletionResult(result: CompletionResult): string {
+  return result.updated
+    ? `Activity ${result.cmid} marked as ${result.completed ? "complete" : "incomplete"}`
+    : `Could not update completion for activity ${result.cmid} (manual completion may not be enabled)`;
+}
+
+export function formatCalendarEvents(events: CalendarEvent[]): string {
+  if (!events.length) {
+    return "No calendar events";
+  }
+  return formatColumns([
+    ["When", "Course", "Event", "Type"],
+    ...events.map((event) => [
+      formatTimestamp(event.starts_at),
+      event.course_name,
+      event.name,
+      event.modname || event.event_type,
+    ]),
+  ]);
+}
+
+export function formatCourseSearchHits(hits: CourseSearchHit[]): string {
+  if (!hits.length) {
+    return "No matches";
+  }
+  return [
+    "Course Search",
+    ...hits.map((hit) =>
+      [
+        hit.course_name,
+        hit.section_name,
+        hit.activity_name || "(section)",
+        hit.modname,
+        hit.matched_in,
+        hit.snippet,
+        hit.url,
+      ]
+        .filter(Boolean)
+        .join(" | "),
+    ),
+  ].join("\n");
+}
+
+export function formatCourseExport(summary: CourseExportSummary): string {
+  const lines = [
+    `Exported '${summary.course_name}' to ${summary.dir}`,
+    `Sections: ${summary.sections}  Pages: ${summary.pages}  Links: ${summary.links}  Files: ${summary.files.length}`,
+  ];
+  const failed = summary.files.filter((file) => file.status === "failed");
+  for (const file of failed) {
+    lines.push(`Failed ${file.name}: ${file.error ?? "unknown error"}`);
+  }
+  return lines.join("\n");
+}
+
+export function formatGradesOverview(rows: GradeOverviewRow[]): string {
+  if (!rows.length) {
+    return "No course grades available";
+  }
+  return formatColumns([
+    ["ID", "Course", "Grade"],
+    ...rows.map((row) => [String(row.course_id), row.course_name, row.grade || "-"]),
+  ]);
+}
+
+export function formatConversations(conversations: Conversation[]): string {
+  if (!conversations.length) {
+    return "No conversations";
+  }
+  return formatColumns([
+    ["ID", "Unread", "Type", "With", "Last message"],
+    ...conversations.map((conversation) => [
+      String(conversation.id),
+      conversation.unread_count ? String(conversation.unread_count) : "",
+      conversation.type,
+      conversation.name,
+      [conversation.last_sender, preview(conversation.last_message, 60)].filter(Boolean).join(": "),
+    ]),
+  ]);
+}
+
+export function formatConversationDetail(detail: ConversationDetail): string {
+  const lines = [`Conversation ${detail.id}${detail.name ? `: ${detail.name}` : ""}`];
+  if (!detail.messages.length) {
+    lines.push("No messages");
+    return lines.join("\n");
+  }
+  for (const message of detail.messages) {
+    lines.push(`${formatTimestamp(message.sent_at)}  ${message.sender_name || message.sender_id}: ${message.text}`);
+  }
+  return lines.join("\n");
+}
+
+export function formatDownloadResults(results: DownloadResult[]): string {
+  if (!results.length) {
+    return "No downloadable files found";
+  }
+  const lines = results.map((result) => {
+    switch (result.status) {
+      case "downloaded":
+        return `Downloaded ${result.file} (${formatBytes(result.bytes)})`;
+      case "exists":
+        return `Skipped ${result.file} (already exists; use --force to overwrite)`;
+      case "planned":
+        return `Would download ${result.name} <- ${result.url}`;
+      case "failed":
+        return `Failed ${result.name}: ${result.error ?? "unknown error"}`;
+    }
+  });
+  const downloaded = results.filter((result) => result.status === "downloaded").length;
+  const failed = results.filter((result) => result.status === "failed").length;
+  if (results.length > 1) {
+    lines.push(`${downloaded} downloaded, ${results.length - downloaded - failed} skipped, ${failed} failed`);
+  }
+  return lines.join("\n");
 }
 
 export function formatActivityDetail(activity: ActivityDetail): string {
@@ -240,6 +415,20 @@ function formatDuration(seconds: number | null): string {
     return `${minutes} min`;
   }
   return `${(minutes / 60).toFixed(1)} h`;
+}
+
+function formatTimestamp(seconds: number): string {
+  return seconds ? new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ") : "-";
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function preview(value: string, maxLen = 100): string {
