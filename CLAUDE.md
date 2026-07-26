@@ -21,14 +21,14 @@ Interpret these as defaults:
 ## Build & Run
 
 ```bash
-uv sync                    # install dependencies
-uv run moodle --help       # run CLI
-uv run moodle -v user      # verbose mode (debug logging)
+npm ci                  # install dependencies
+npm run check           # typecheck (tsc --noEmit)
+npm test                # vitest run
+npm run build           # typecheck + tsup bundle → dist/moodle.js
+node dist/moodle.js     # run built CLI
 ```
 
-Entry point: `moodle_cli.cli:main` (registered as `moodle` console script in pyproject.toml).
-
-No tests exist yet. No linter/formatter is configured.
+TypeScript (ESM, Node >= 20), bundled by tsup into a single `dist/moodle.js` (the `moodle` bin). No linter/formatter is configured. CI (`.github/workflows/ci.yml`) runs typecheck, tests, build, npm-pack content/smoke checks, and a skill-bundle drift check on Node 20/22 and Bun.
 
 ## Architecture
 
@@ -43,30 +43,32 @@ Request format: `POST /lib/ajax/service.php?sesskey={sesskey}&info={function_nam
 ### Data Flow
 
 ```
-auth.py (get cookie) → client.py (API calls) → parser.py (JSON→models) → formatter.py/output.py (display)
-         ↑                    ↑
-    env var or            sesskey auto-obtained
-    browser-cookie3       from get_site_info()
+auth.ts (get cookie) → client.ts (AJAX calls, scraping fallback) → parsers.ts / scraper.ts (→ models) → formatters.ts / output.ts (display)
+        ↑                     ↑
+   env var, browser      sesskey + userid auto-resolved;
+   cookies, or cached    session cached in ~/.cache/moodle-cli/session.json
+   session
 ```
 
-- **cli.py**: Click command group. `main()` wraps `cli(standalone_mode=False)` to handle `AuthError`/`MoodleAPIError` cleanly. Client is lazily created via `ctx.obj["get_client"]()` closure — auth only happens when a command actually needs the API.
-- **auth.py**: Priority: `MOODLE_SESSION` env var → browser-cookie3 extraction (Chrome, Firefox, Brave, Edge). Arc browser is not supported by browser-cookie3.
-- **client.py**: `MoodleClient` — holds session cookie, auto-obtains `sesskey`+`userid` on first API call via `_ensure_session()`.
-- **models.py**: Dataclasses (`UserInfo`, `Course`, `Section`, `Activity`) with `to_dict()` for serialization.
-- **parser.py**: Pure functions transforming Moodle JSON dicts → model instances.
-- **formatter.py**: Rich tables (courses) and trees (course sections→activities).
-- **output.py**: `--json`/`--yaml` structured output to stdout.
-- **config.py**: Loads `config.yaml` from CWD or `~/.config/moodle-cli/`. If no `base_url` is configured, it prompts the user, validates the root URL, probes the site, and saves the result. `MOODLE_BASE_URL` env var overrides.
-- **constants.py**: API paths, function names, env var names.
+- **cli.ts**: Commander program. `buildProgram(io)` takes injectable IO (stdout/stderr/fetch/env/homeDir) so tests can drive the full CLI. `runCli()` maps errors (`CliError` hierarchy in errors.ts) to exit codes and JSON error output. A bare URL argument dispatches to the matching command via url-resolver.ts.
+- **auth.ts**: Cookie priority: `MOODLE_SESSION` env var → cached session → browser cookie extraction. Sessions persist via **session-cache.ts** (24h TTL, `--no-cache` bypasses reads).
+- **client.ts**: `MoodleClient` — batched AJAX calls (`callBatch`), auto re-auth on session expiry, per-method fallbacks to **scraper.ts** (HTML scraping with node-html-parser) when AJAX functions are disabled server-side.
+- **models.ts**: Plain interfaces with snake_case serialization fields.
+- **parsers.ts**: Pure functions transforming Moodle JSON dicts → model instances. **scraper.ts** does the same from HTML.
+- **formatters.ts**: Human-readable table/tree output. **output.ts**: `--json`/`--yaml`/`--fields` structured output (default is JSON when stdout is not a TTY).
+- **config.ts**: Loads `config.yaml` from CWD or `~/.config/moodle-cli/`. If no `base_url` is configured, it prompts, validates, probes the site, and saves. `MOODLE_BASE_URL` env var overrides.
+- **download.ts / export.ts**: authenticated file downloads (`download` command; resource/folder/assign-submission plans) and whole-course offline export (`export`). **course-search.ts**: client-side search over course contents (`search`). **ics.ts**: local ICS generation for `calendar --ics`.
+- **Write operations** go through the web-form route (cookie + sesskey + hidden-field replay via `parseFormWithField`), not AJAX, because sites disable most mod_* WS functions: **assign-submit.ts** (`submit` — draft upload via /repository/repository_ajax.php then savesubmission; `--submit --confirm` for the confirmsubmit lock step), **choice.ts** (`choice --answer`), **feedback.ts** (`feedback --answer`, multi-page). Completion ticks (`complete`) and `alerts --mark-read` use ajax-enabled core functions directly.
+- **keepalive.ts**: `auth keepalive` commands + macOS launch agent that renews the session periodically.
+- **skills.ts**: Generates the agent skill bundle (`SKILL.md`, `references/`, `agents/openai.yaml`) from the Commander command tree. Regenerate with `npm run skill:generate` after touching commands; CI fails on drift.
+- **constants.ts**: API paths, AJAX function names, env var names.
 
 ### Adding a New Command
 
-1. Add the Moodle AJAX function name to `constants.py`
-2. Add a method to `MoodleClient` in `client.py` (call `self._ensure_session()` first)
-3. Add model dataclass to `models.py`, parser function to `parser.py`
-4. Add Rich display function to `formatter.py`
-5. Add `@cli.command()` in `cli.py` with `--json`/`--yaml` options
-
-### Adding a New Moodle API Call
-
-All API calls go through `MoodleClient._call(function_name, args)`. It handles the AJAX envelope format and error extraction. Just add a new public method that calls `self._call()` with the right function name.
+1. Add the Moodle AJAX function name / view path to `constants.ts`
+2. Add a method to `MoodleClient` in `client.ts` (scraping fallback in `scraper.ts` if the AJAX function may be disabled)
+3. Add a model interface to `models.ts`, parser to `parsers.ts`
+4. Add a display function to `formatters.ts`
+5. Register the command in `cli.ts` via `addOutputOptions(program.command(...))`
+6. Add a vitest test in `tests/` (mock `fetchImpl` through `buildProgram`/`createMoodleClient` IO injection)
+7. Rebuild (`npm run build`) and run `npm run skill:generate`; commit the regenerated `SKILL.md`/`references/`/`agents/openai.yaml`
