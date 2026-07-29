@@ -71,6 +71,42 @@ export function htmlToStructuredContent(html: string, baseUrl: string): Structur
   return { text, image_urls, links, tables };
 }
 
+export function htmlToMarkdown(
+  html: string,
+  baseUrl: string,
+  rewriteUrl: (url: string) => string = (url) => url,
+): string {
+  const root = parse(html);
+  for (const br of root.querySelectorAll("br")) {
+    br.replaceWith("\n");
+  }
+  for (const img of root.querySelectorAll("img")) {
+    const src = (img.getAttribute("src") ?? "").trim();
+    const label = (img.getAttribute("alt") ?? "").trim() || "image";
+    img.replaceWith(src ? `![${label}](${rewriteUrl(resolveUrl(baseUrl, src))})` : `![${label}]`);
+  }
+  for (const link of root.querySelectorAll("a[href]")) {
+    const href = (link.getAttribute("href") ?? "").trim();
+    const label = cleanText(link.textContent) || href;
+    link.replaceWith(href ? `[${label}](${rewriteUrl(resolveUrl(baseUrl, href))})` : label);
+  }
+  for (const item of root.querySelectorAll("li")) {
+    item.replaceWith(`- ${cleanText(item.textContent)}\n`);
+  }
+  for (const paragraph of root.querySelectorAll("p")) {
+    paragraph.replaceWith(`${paragraph.textContent.trim()}\n\n`);
+  }
+  for (let level = 1; level <= 6; level += 1) {
+    for (const heading of root.querySelectorAll(`h${level}`)) {
+      heading.replaceWith(`${"#".repeat(level)} ${cleanText(heading.textContent)}\n\n`);
+    }
+  }
+  return root.textContent
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function cleanText(value: string | null | undefined): string {
   return decodeHtml(value ?? "").replace(/\s+/g, " ").trim();
 }

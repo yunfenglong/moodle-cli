@@ -25,6 +25,22 @@ Each command accepts a numeric module ID or its full Moodle URL:
 | Moodle page | `moodle page PAGE --json` |
 | Folder | `moodle folder FOLDER --json` |
 
+Download a Page body and its Moodle-hosted attachments with either its numeric course-module ID or full URL:
+
+```bash
+moodle download PAGE --dir ./notes
+```
+
+The result contains `Page name.md` and `Page name.assets/`. Course downloads and exports include Page attachments as well.
+
+Download one numbered course section by course code and week:
+
+```bash
+moodle download FIT1061 1 --dir ./w1
+```
+
+This downloads resource, folder, and Page content only from Moodle section 1.
+
 When the user supplies a supported Moodle URL without naming a command, route it directly:
 
 ```bash

@@ -206,15 +206,26 @@ export function buildProgram(io: CliIO = {}): Command {
       runtime.output(conversations, () => formatConversations(conversations), options);
     });
 
-  addOutputOptions(program.command("download").description("Download files from a resource, folder, or whole course.").argument("[target]", "Resource/folder ID or URL, or a direct file URL"))
-    .option("--course <course>", "Download all resource and folder files in a course.")
+  addOutputOptions(program.command("download").description("Download resources, folders, Pages with attachments, a course week, or a whole course.").argument("[target]", "Resource/Page module ID or URL, folder URL, direct file URL, or course code when WEEK is provided").argument("[week]", "Course section/week number"))
+    .option("--course <course>", "Download all resource, folder, and Page content in a course.")
     .option("--dir <dir>", "Destination directory.", ".")
     .option("--force", "Overwrite existing files.")
     .option("--dry-run", "List what would be downloaded without downloading.")
-    .action(async (target: string | undefined, options: OutputCommandOptions & { course?: string; dir: string; force?: boolean; dryRun?: boolean }) => {
+    .action(async (target: string | undefined, week: string | undefined, options: OutputCommandOptions & { course?: string; dir: string; force?: boolean; dryRun?: boolean }) => {
       const client = await runtime.getClient();
-      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
-      const plans = await planDownloads(client, target, courseId);
+      if (week !== undefined && options.course) {
+        throw new UsageError("Use either COURSE WEEK positional arguments or --course, not both.");
+      }
+      if (target !== undefined && options.course) {
+        throw new UsageError("Do not provide a target together with --course.");
+      }
+      const sectionNumber = week === undefined ? undefined : parsePositiveInt(week);
+      const courseId = sectionNumber !== undefined
+        ? await client.resolveCourseReference(target ?? "")
+        : options.course
+          ? await client.resolveCourseReference(options.course)
+          : undefined;
+      const plans = await planDownloads(client, sectionNumber === undefined ? target : undefined, courseId, sectionNumber);
       const results = await executeDownloads(client, plans, { dir: options.dir, force: options.force, dryRun: options.dryRun });
       runtime.output(results, () => formatDownloadResults(results), options);
     });

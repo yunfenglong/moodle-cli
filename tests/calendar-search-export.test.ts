@@ -202,26 +202,43 @@ describe("course export", () => {
         ],
       }]),
       (request) => request.url === `${BASE_URL}/mod/resource/view.php?id=55` ? htmlResponse(fixture("resource.html")) : undefined,
-      (request) => request.url === `${BASE_URL}/mod/page/view.php?id=66` ? htmlResponse(fixture("page.html")) : undefined,
+      (request) => request.url === `${BASE_URL}/mod/page/view.php?id=66` ? htmlResponse(fixture("page-files.html")) : undefined,
       (request) => request.url === `${BASE_URL}/mod/url/view.php?id=88` ? htmlResponse(fixture("link.html")) : undefined,
       (request) => request.url === `${BASE_URL}/pluginfile.php/1/slides.pdf`
         ? new Response(new Uint8Array([37, 80, 68, 70]), { status: 200, headers: { "Content-Type": "application/pdf", "Content-Disposition": 'attachment; filename="slides.pdf"' } })
         : undefined,
+      (request) => request.url === `${BASE_URL}/pluginfile.php/10/mod_page/content/35/handout.pdf?forcedownload=1`
+        ? new Response("handout", { headers: { "Content-Type": "application/pdf" } })
+        : undefined,
+      (request) => request.url === `${BASE_URL}/pluginfile.php/10/mod_page/content/35/diagram.png`
+        ? new Response("diagram", { headers: { "Content-Type": "image/png" } })
+        : undefined,
     ]);
     const client = new MoodleClient(BASE_URL, "session");
     const dir = await mkdtemp(join(tmpdir(), "moodle-export-"));
+
+    const coursePlans = await planDownloads(client, undefined, 101);
+    expect(coursePlans.map((plan) => plan.relative_path).filter(Boolean)).toEqual([
+      "Week Notes.md",
+      "Week Notes.assets/handout.pdf",
+      "Week Notes.assets/diagram.png",
+    ]);
 
     const summary = await exportCourse(client, 101, { dir });
 
     expect(summary.course_name).toBe("Mathematics 101");
     expect(summary.sections).toBe(1);
     expect(summary.links).toBe(1);
-    expect(summary.files).toHaveLength(1);
+    expect(summary.files).toHaveLength(3);
     expect(summary.files[0].status).toBe("downloaded");
     const readme = readFileSync(join(summary.dir, "README.md"), "utf8");
     expect(readme).toContain("# Mathematics 101");
     expect(readme).toContain("## Week 1");
     expect(readme).toContain("- [file] Slides");
     expect(existsSync(join(summary.dir, "00 Week 1", "slides.pdf"))).toBe(true);
+    expect(existsSync(join(summary.dir, "00 Week 1", "Week Notes.assets", "handout.pdf"))).toBe(true);
+    const pageMarkdown = readFileSync(join(summary.dir, "00 Week 1", "Week Notes.md"), "utf8");
+    expect(pageMarkdown).toContain("[handout](Week Notes.assets/handout.pdf)");
+    expect(pageMarkdown).toContain("[external reference](https://example.com/reference)");
   });
 });

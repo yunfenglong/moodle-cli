@@ -19,7 +19,7 @@ Read this file for exact arguments, flags, and defaults after selecting a branch
 | moodle complete | Manually mark an activity as complete. | <activity> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--undo |
 | moodle course | Show course detail with sections. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle courses | List enrolled courses. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle download | Download files from a resource, folder, or whole course. | [target] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--dir (default: .; value required)<br>--force<br>--dry-run |
+| moodle download | Download resources, folders, Pages with attachments, a course week, or a whole course. | [target] [week] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--dir (default: .; value required)<br>--force<br>--dry-run |
 | moodle export | Export course pages, links, and files to a local directory. | <course> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--dir (default: .; value required)<br>--force |
 | moodle feedback | List feedback questions, or fill it in with --answer. | <feedback> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--answer (value required) |
 | moodle folder | Show folder details. | <folder> | --json<br>--yaml<br>--table<br>--fields (value required) |

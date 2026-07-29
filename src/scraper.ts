@@ -300,13 +300,64 @@ export function parseLinkHtml(html: string, linkId: number, baseUrl: string): Li
 export function parsePageHtml(html: string, pageId: number, baseUrl: string): Page {
   const root = parse(html);
   const content = first(root, [".box.generalbox", ".activity-description", "[data-region='page-content']", "main"]);
+  const contentHtml = content?.innerHTML ?? "";
+  const structured = htmlToStructuredContent(contentHtml, baseUrl);
   return {
     id: pageId,
     name: pageTitle(html),
     ...activityContext(html),
-    content_text: content ? htmlToStructuredContent(content.innerHTML, baseUrl).text : "",
+    content_text: structured.text,
+    content_html: contentHtml,
+    image_urls: structured.image_urls,
+    links: structured.links,
+    tables: structured.tables,
+    files: pagePluginFiles(structured.links, structured.image_urls),
     url: `${baseUrl.replace(/\/$/, "")}/mod/page/view.php?id=${pageId}`,
   };
+}
+
+function pagePluginFiles(
+  links: Array<{ text: string; url: string }>,
+  imageUrls: string[],
+): Array<{ name: string; url: string }> {
+  const files: Array<{ name: string; url: string }> = [];
+  const seen = new Set<string>();
+  for (const candidate of [
+    ...links.map((link) => ({ name: link.text, url: link.url })),
+    ...imageUrls.map((url) => ({ name: "", url })),
+  ]) {
+    if (!isPluginFileUrl(candidate.url)) {
+      continue;
+    }
+    const key = canonicalPluginFileUrl(candidate.url);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    files.push({ name: filenameFromPluginFile(candidate.name, candidate.url), url: candidate.url });
+  }
+  return files;
+}
+
+function isPluginFileUrl(value: string): boolean {
+  try {
+    return new URL(value).pathname.startsWith("/pluginfile.php/");
+  } catch {
+    return false;
+  }
+}
+
+function canonicalPluginFileUrl(value: string): string {
+  const url = new URL(value);
+  url.searchParams.delete("forcedownload");
+  url.searchParams.sort();
+  return url.toString();
+}
+
+function filenameFromPluginFile(label: string, value: string): string {
+  const pathname = new URL(value).pathname;
+  const basename = decodeURIComponent(pathname.split("/").filter(Boolean).at(-1) ?? "");
+  return /\.[a-z0-9]{1,10}$/i.test(label.trim()) ? label.trim() : basename || label.trim() || "attachment";
 }
 
 export function parseFolderHtml(html: string, folderId: number, baseUrl: string): Folder {

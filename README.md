@@ -7,6 +7,7 @@ Terminal-first CLI for Moodle LMS that reuses an authenticated browser session. 
 - Reuses `MoodleSession` from `okta-auth`, your browser, or `MOODLE_SESSION`
 - Uses Moodle AJAX APIs and falls back to authenticated page scraping when needed
 - Lists courses, deadlines, alerts, activities, grades, and forum discussions
+- Downloads resources, folders, and Moodle Pages with their embedded files
 - Agent-friendly JSON/YAML output, field selection, and stable exit codes
 
 ## Install
@@ -81,6 +82,10 @@ moodle overview
 moodle courses
 moodle grades 34637
 moodle activities 34637
+moodle download 12345 --dir ./notes
+moodle download FIT1061 1 --dir ./w1
+moodle download --course 34637 --dir ./course-files
+moodle export 34637 --dir ./offline-courses
 moodle https://school.example.edu/course/view.php?id=34637
 moodle https://school.example.edu/mod/forum/discuss.php?d=9001#p9101 --json
 moodle skills
@@ -91,6 +96,10 @@ moodle update --check-only
 ```
 
 Supported Moodle URLs can be passed as the first argument. The CLI routes forum discussion, forum view, assignment, quiz, resource, link, page, folder, course, and grade report URLs to the shortest matching command.
+
+`moodle download PAGE_ID` accepts only the Page course-module ID. A Page download writes `Page name.md` plus a `Page name.assets/` directory, rewrites Moodle attachment links to local relative paths, and leaves external links intact. Numeric resource IDs remain supported.
+
+`moodle download COURSE WEEK` resolves a course ID, short code, or unique course name and downloads only that numbered Moodle section. For example, `moodle download FIT1061 1 --dir ./w1` downloads the resources, folders, Pages, and Page attachments from section 1.
 
 ## Agent Output Contract
 

@@ -244,6 +244,8 @@ export interface DownloadItem {
   name: string;
   url: string;
   source: string;
+  relative_path?: string;
+  content?: string;
 }
 
 export interface DownloadResult {
@@ -312,6 +314,11 @@ export interface Page {
   course_name: string;
   section_name: string;
   content_text: string;
+  content_html: string;
+  image_urls: string[];
+  links: Array<{ text: string; url: string }>;
+  tables: Array<{ headers: string[]; rows: string[][] }>;
+  files: Array<{ name: string; url: string }>;
   url: string;
 }
 

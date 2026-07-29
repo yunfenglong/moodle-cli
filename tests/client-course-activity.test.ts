@@ -357,6 +357,61 @@ describe("MoodleClient course/activity modules", () => {
     ]);
   });
 
+  it("downloads one course week from a short code and week number", async () => {
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      ajaxRoute("core_enrol_get_users_courses", [{
+        id: 1061,
+        shortname: "FIT1061",
+        fullname: "Introduction to Programming",
+        category: 4,
+        visible: true,
+        startdate: 1700000000,
+      }]),
+      ajaxRoute("core_course_get_contents", [
+        {
+          id: 11,
+          name: "Week 1",
+          section: 1,
+          visible: true,
+          summary: "",
+          modules: [
+            { id: 55, name: "Week 1 slides", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=55`, visible: true, description: "" },
+          ],
+        },
+        {
+          id: 12,
+          name: "Week 2",
+          section: 2,
+          visible: true,
+          summary: "",
+          modules: [
+            { id: 77, name: "Week 2 slides", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=77`, visible: true, description: "" },
+          ],
+        },
+      ]),
+      (request) => request.url === `${BASE_URL}/mod/resource/view.php?id=55` ? htmlResponse(fixture("resource.html")) : undefined,
+    ]);
+
+    const result = await runJsonCommand(["download", "FIT1061", "1", "--dir", "./w1", "--dry-run", "--json"], fetchImpl);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([{
+      name: "slides.pdf",
+      url: `${BASE_URL}/pluginfile.php/1/slides.pdf`,
+      bytes: 0,
+      status: "planned",
+    }]);
+
+    const missing = await runJsonCommand(["download", "FIT1061", "3", "--dry-run", "--json"], fetchImpl);
+    expect(missing.code).toBe(4);
+    expect(JSON.parse(missing.stderr).message).toBe("Week 3 was not found in course 1061.");
+
+    const conflicting = await runJsonCommand(["download", "FIT1061", "--course", "FIT1061", "--dry-run", "--json"], fetchImpl);
+    expect(conflicting.code).toBe(3);
+    expect(JSON.parse(conflicting.stderr).message).toMatch(/together with --course/);
+  });
+
   it("prints CLI JSON parity for todo, alerts, and overview", async () => {
     const fetchImpl = cliFetch([
       dashboardRoute,

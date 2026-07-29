@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MoodleClient } from "./client.js";
-import { executeDownloads, planFolderDownload, planResourceDownload, sanitizeFilename } from "./download.js";
+import { executeDownloads, planFolderDownload, planPageDownloads, planResourceDownload, sanitizeFilename } from "./download.js";
 import type { CourseExportSummary, DownloadItem, DownloadResult } from "./models.js";
 
 export interface ExportOptions {
@@ -40,13 +40,10 @@ export async function exportCourse(client: MoodleClient, courseId: number, optio
         plans.push(...(await planFolderDownload(client, activity.id, activity.name)));
         indexLines.push(`- [folder] ${activity.name}`);
       } else if (activity.modname === "page") {
-        const page = await client.getPage(activity.id);
-        if (page.content_text) {
-          await mkdir(sectionDir, { recursive: true });
-          const file = join(sectionDir, sanitizeFilename(`${activity.name}.md`));
-          await writeFile(file, `# ${page.name || activity.name}\n\n${page.url}\n\n${page.content_text}\n`);
-          pages += 1;
-        }
+        const pagePlans = await planPageDownloads(client, activity.id);
+        const pageResults = await executeDownloads(client, pagePlans, { dir: sectionDir, force: options.force });
+        files.push(...pageResults.slice(1));
+        pages += 1;
         indexLines.push(`- [page] ${activity.name}`);
       } else if (activity.modname === "url") {
         const link = await client.getLink(activity.id);
