@@ -1,13 +1,14 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import type { Command } from "commander";
+import type { CommandDescription } from "@bunizao/cli-kit";
+import { describeProgram, intentContracts } from "./command-contract.js";
 
 export const SKILL_NAME = "moodle-cli";
 export const SKILL_SOURCE = "https://github.com/bunizao/moodle-cli";
 export const SKILLS_SPEC_URL = "https://github.com/vercel-labs/skills";
-export const SKILL_DESCRIPTION =
-  "Read Moodle data with the `moodle` CLI. Use for authenticated profile, course discovery, deadlines, alerts, sections, activities, grades, assignment or quiz detail, resources, forum search and discussions, supported Moodle URLs, authentication diagnostics, or CLI updates.";
+export const SKILL_DESCRIPTION = "Read Moodle units, deadlines, grades, announcements and files; submit assignment files; diagnose sign-in and manage a private MCP server.";
 
 export interface SkillFlag {
   name: string;
@@ -42,12 +43,6 @@ type RunCommand = typeof spawnSync;
 const SKILL_BUNDLE_TEMPLATES = [
   ["SKILL.md", "skill.template.md"],
   ["references/setup-and-auth.md", "skill-references/setup-and-auth.md"],
-  ["references/profile-and-courses.md", "skill-references/profile-and-courses.md"],
-  ["references/deadlines-and-alerts.md", "skill-references/deadlines-and-alerts.md"],
-  ["references/coursework-and-grades.md", "skill-references/coursework-and-grades.md"],
-  ["references/forums.md", "skill-references/forums.md"],
-  ["references/output-and-errors.md", "skill-references/output-and-errors.md"],
-  ["references/maintenance.md", "skill-references/maintenance.md"],
   ["references/command-reference.md", "skill-references/command-reference.md"],
   ["agents/openai.yaml", "skill-agents/openai.yaml"],
 ] as const;
@@ -60,7 +55,6 @@ export function formatSkillSummary(): string {
     `Spec: ${SKILLS_SPEC_URL}`,
     `Install: npx skills add ${SKILL_SOURCE}`,
     "CLI alias: moodle skills add (falls back to npm exec)",
-    "Generate: moodle skills generate (writes SKILL.md, references/, and agents/)",
   ].join("\n");
 }
 
@@ -104,13 +98,28 @@ export function installSkill(extraArgs: string[] = [], options: Parameters<typeo
 }
 
 export function extractCommanderCommands(program: Command): SkillCommand[] {
-  return collectCommandRows(program).map((row) => ({
-    name: row.path.at(-1) ?? "",
-    path: row.path,
-    description: row.description,
-    arguments: row.arguments,
-    flags: row.flags,
-  }));
+  return describeProgram(program).commands.flatMap((command) => commandDescriptionRows(command));
+}
+
+function commandDescriptionRows(command: CommandDescription, parentPath: string[] = []): SkillCommand[] {
+  const path = [...parentPath, command.name];
+  const row: SkillCommand = {
+    name: command.name,
+    path,
+    description: command.description,
+    arguments: command.positionals.map((argument) => ({
+      name: argument.name,
+      required: argument.required,
+      variadic: argument.variadic,
+    })),
+    flags: command.options.map((option) => {
+      const names = option.flags.match(/-{1,2}[\w-]+/g) ?? [];
+      const name = names.find((value) => value.startsWith("--")) ?? names[0] ?? option.flags;
+      const alias = names.find((value) => value !== name);
+      return { name, alias, description: option.description, required: option.required };
+    }),
+  };
+  return [row, ...command.commands.flatMap((child) => commandDescriptionRows(child, path))];
 }
 
 export function generateSkillMarkdown(program: Command): string;
@@ -127,6 +136,7 @@ export function generateSkillMarkdown(input: Command | GenerateOptions): string 
 export function writeGeneratedSkill(program: Command, target = "SKILL.md"): void {
   const commands = extractCommanderCommands(program);
   const targetDir = path.dirname(target);
+  for (const obsolete of ["profile-and-courses", "deadlines-and-alerts", "coursework-and-grades", "downloads", "forums", "output-and-errors", "maintenance"]) rmSync(path.join(targetDir, "references", `${obsolete}.md`), { force: true });
   for (const [relativeTarget, relativeTemplate] of SKILL_BUNDLE_TEMPLATES) {
     const outputPath = relativeTarget === "SKILL.md" ? target : path.join(targetDir, relativeTarget);
     mkdirSync(path.dirname(outputPath), { recursive: true });
@@ -150,53 +160,6 @@ function renderSkillMarkdown(commands: SkillCommand[], template: string): string
   return `${markdown.trimEnd()}\n`;
 }
 
-function collectCommandRows(command: Command, parentPath: string[] = []): Array<Required<Pick<SkillCommand, "path">> & Omit<SkillCommand, "path" | "children">> {
-  const isRoot = !(command as unknown as { parent?: Command }).parent;
-  const commandPath = isRoot ? parentPath : [...parentPath, command.name()];
-  const ownRows = isRoot || isHiddenCommand(command)
-    ? []
-    : [{
-        name: command.name(),
-        path: commandPath,
-        description: command.description() || "",
-        arguments: readArguments(command),
-        flags: readFlags(command),
-      }];
-
-  const childRows = command.commands
-    .filter((child) => !isHiddenCommand(child) && child.name() !== "help")
-    .flatMap((child) => collectCommandRows(child, commandPath));
-  return [...ownRows, ...childRows];
-}
-
-function readArguments(command: Command): SkillArgument[] {
-  const args = ((command as unknown as { registeredArguments?: unknown[]; _args?: unknown[] }).registeredArguments
-    ?? (command as unknown as { _args?: unknown[] })._args
-    ?? []) as Array<Record<string, unknown>>;
-
-  return args.map((arg) => {
-    const nameValue = typeof arg.name === "function" ? arg.name.call(arg) : arg.name;
-    return {
-      name: String(nameValue ?? ""),
-      required: Boolean(arg.required),
-      variadic: Boolean(arg.variadic),
-    };
-  }).filter((arg) => arg.name);
-}
-
-function readFlags(command: Command): SkillFlag[] {
-  return command.options.map((option) => {
-    const value = option as unknown as Record<string, unknown>;
-    return {
-      name: typeof value.long === "string" ? value.long : findLongFlag(option.flags),
-      alias: typeof value.short === "string" ? value.short : findShortFlag(option.flags),
-      description: option.description ?? "",
-      defaultValue: value.defaultValue,
-      required: Boolean(value.required ?? value.mandatory),
-    };
-  }).filter((flag) => flag.name);
-}
-
 function renderFrontmatter(): string {
   return [
     "---",
@@ -207,25 +170,7 @@ function renderFrontmatter(): string {
 }
 
 function renderIntentTable(): string {
-  return renderMarkdownTable(
-    ["User intent", "Command"],
-    [
-      ["Show my profile or account info", "moodle user --json"],
-      ["List my courses", "moodle courses --json"],
-      ["Find nearest deadlines or upcoming actions", "moodle todo --limit 5 --days 14 --json"],
-      ["List alerts or unread notifications", "moodle alerts --limit 10 --json"],
-      ["Show a compact dashboard", "moodle overview --todo-limit 5 --alerts-limit 5 --json"],
-      ["Show activities in a course", "moodle activities COURSE_ID --json"],
-      ["Show course sections", "moodle course COURSE_ID --json"],
-      ["Show grades for a course", "moodle grades COURSE_ID --json"],
-      ["Find the best forum match", "moodle forum find QUERY --json"],
-      ["Open a forum discussion URL or ID", "moodle forum discussion DISCUSSION_OR_URL --json"],
-      ["Check session freshness or authentication state", "moodle auth status --json"],
-      ["Keep the session alive to avoid repeated logins", "moodle auth keepalive install"],
-      ["Check whether the CLI has an update", "moodle update --json"],
-      ["Install this agent skill", "moodle skills add"],
-    ],
-  );
+  return renderMarkdownTable(["Intent", "Run"], Object.values(intentContracts).filter(c => c.command !== "moodle threads show ID").map(c => [c.when, c.command]));
 }
 
 function renderCommandReference(commands: SkillCommand[]): string {
@@ -245,13 +190,13 @@ function renderOutputContract(): string {
   return [
     "### Output Contract",
     "",
-    "- `--json` writes JSON to stdout.",
+    "- `--json` and piped output write compact JSON. `--pretty` indents it.",
     "- `--yaml` writes YAML to stdout when supported.",
     "- `--table` forces human-readable table/tree output.",
     "- When stdout is not a TTY, commands default to JSON unless `--table` is set.",
-    "- `--fields a,b,c` keeps only listed top-level fields. Arrays apply the field filter to each item.",
+    "- `--fields a,b,c` keeps only listed top-level fields. Use envelope keys such as `units`, `due`, `item`, and `total`.",
     "- Invalid `--fields` values are usage errors and list valid fields.",
-    "- With JSON output enabled, errors are one JSON line on stderr: `{\"error\":true,\"code\":\"auth_failed\",\"message\":\"...\",\"hint\":\"...\"}`.",
+    "- Structured errors use `{ok:false,error:{code,message,hint},exit_code}` on stderr.",
     "",
     "Exit codes:",
     "",
@@ -259,10 +204,11 @@ function renderOutputContract(): string {
       ["Code", "Meaning"],
       [
         ["0", "Success"],
-        ["1", "Unexpected error"],
-        ["2", "Authentication or configuration error"],
-        ["3", "Usage error"],
+        ["1", "Network, configuration, or unexpected error"],
+        ["2", "Usage error"],
+        ["3", "Authentication error"],
         ["4", "Requested course, activity, forum, or discussion was not found"],
+        ["5", "Moodle rejected a well-formed request"],
       ],
     ),
   ].join("\n");
@@ -317,22 +263,10 @@ function isCommandAvailable(name: string, runCommand: RunCommand): boolean {
   return !result.error && result.status === 0;
 }
 
-function isHiddenCommand(command: Command): boolean {
-  return Boolean((command as unknown as { hidden?: boolean; _hidden?: boolean }).hidden || (command as unknown as { _hidden?: boolean })._hidden);
-}
-
 function isGenerateOptions(value: Command | GenerateOptions): value is GenerateOptions {
   return "template" in value && "commands" in value;
 }
 
 function readSkillTemplate(relativePath = "skill.template.md"): string {
   return readFileSync(path.join(process.cwd(), "src", relativePath), "utf8");
-}
-
-function findLongFlag(flags: string): string {
-  return flags.split(/[,\s]+/).find((part) => part.startsWith("--")) ?? "";
-}
-
-function findShortFlag(flags: string): string | undefined {
-  return flags.split(/[,\s]+/).find((part) => /^-[^-]/.test(part));
 }

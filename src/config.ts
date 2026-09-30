@@ -1,10 +1,14 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { createInterface } from "node:readline/promises";
+import { join } from "node:path";
+import type { Writable } from "node:stream";
+import { createUi, isAgentEnvironment, type Ui } from "@bunizao/cli-kit";
+
+import { showWordmark } from "./wordmark.js";
 import YAML from "yaml";
-import { CONFIG_DIR_NAME, CONFIG_FILENAME, ENV_MOODLE_BASE_URL } from "./constants.js";
+import { CONFIG_DIR_NAME, CONFIG_FILENAME, ENV_MOODLE_BASE_URL, ENV_MOODLE_CONFIG, ENV_MOODLE_URL } from "./constants.js";
 import { ConfigError } from "./errors.js";
+import { writeFileAtomic } from "./atomic-write.js";
 
 export interface MoodleConfig extends Record<string, unknown> {
   baseUrl: string;
@@ -29,11 +33,10 @@ export interface ConfigOptions {
 
 export interface ConfigFs {
   readFile: typeof readFile;
-  writeFile: typeof writeFile;
-  mkdir: typeof mkdir;
+  write: (path: string, content: string) => Promise<void>;
 }
 
-const nodeFs: ConfigFs = { readFile, writeFile, mkdir };
+const nodeFs: ConfigFs = { readFile, write: (path, content) => writeFileAtomic(path, content) };
 
 export function cwdConfigPath(cwd = process.cwd()): string {
   return join(cwd, CONFIG_FILENAME);
@@ -82,6 +85,10 @@ export async function loadConfig(options: ConfigOptions = {}): Promise<MoodleCon
   if (env[ENV_MOODLE_BASE_URL]) {
     return { baseUrl: normalizeBaseUrl(env[ENV_MOODLE_BASE_URL]) };
   }
+  if (env[ENV_MOODLE_URL]) {
+    (options.stderr ?? process.stderr).write(`${ENV_MOODLE_URL} is deprecated; use ${ENV_MOODLE_BASE_URL}.\n`);
+    return { baseUrl: normalizeBaseUrl(env[ENV_MOODLE_URL]) };
+  }
 
   const loaded = await loadExistingConfig(options);
   if (loaded.config.base_url) {
@@ -99,27 +106,35 @@ export async function loadConfig(options: ConfigOptions = {}): Promise<MoodleCon
 }
 
 export async function promptForBaseUrl(options: ConfigOptions = {}): Promise<string> {
-  const prompt = options.prompt ?? defaultPrompt(options);
-  const output = options.stderr ?? process.stderr;
-  output.write("Configuration required\n");
-  output.write("Moodle base URL is not configured yet.\n");
-  output.write("Required format: https://school.example.edu\n");
-  output.write("Use the site root only. Do not include paths like /login/index.php or /my/.\n");
+  // An injected prompt (tests) means plain lines; a real terminal gets the guided setup.
+  const ui = createUi({ input: process.stdin, output: (options.stderr ?? process.stderr) as Writable, ...(options.prompt ? { interactive: false } : {}) });
+  const prompt = options.prompt ?? defaultPrompt(ui);
+  showWordmark(ui);
+  ui.intro("Moodle setup");
+  ui.note([
+    "Moodle base URL is not configured yet.",
+    `Runtime: ${process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`}. Browser SQLite needs Bun or Node 22.13+. Run moodle doctor for diagnostics.`,
+    "Use the site root only, for example https://school.example.edu.",
+    "Do not include paths like /login/index.php or /my/.",
+  ].join("\n"), "Configuration required");
 
   while (true) {
     let baseUrl: string;
     try {
       baseUrl = normalizeBaseUrl(await prompt("Moodle base URL"));
     } catch (error) {
-      output.write(`Invalid URL: ${error instanceof Error ? error.message : String(error)}\n`);
+      ui.warn(`Invalid URL: ${error instanceof Error ? error.message : String(error)}`);
       continue;
     }
 
+    const spin = ui.spinner();
+    spin.start(`Checking ${baseUrl}`);
     const probe = await probeBaseUrl(baseUrl, options);
     if (probe.ok) {
+      spin.stop(`${baseUrl} looks like Moodle`);
       return baseUrl;
     }
-    output.write(`Validation failed: ${probe.message ?? "site did not look like Moodle"}\n`);
+    spin.error(`Validation failed: ${probe.message ?? "site did not look like Moodle"}`);
   }
 }
 
@@ -168,13 +183,18 @@ export function missingBaseUrlMessage(configPath: string | null, options: Config
 }
 
 async function loadExistingConfig(options: ConfigOptions): Promise<{ config: Record<string, unknown>; path: string | null }> {
-  for (const path of [cwdConfigPath(options.cwd), userConfigPath(options.homeDir)]) {
+  const env = options.env ?? process.env;
+  const explicitPath = env[ENV_MOODLE_CONFIG];
+  const paths = [explicitPath, cwdConfigPath(options.cwd), userConfigPath(options.homeDir)].filter(
+    (value): value is string => Boolean(value),
+  );
+  for (const path of paths) {
     const config = await readConfigFile(path, options);
     if (config) {
       return { config, path };
     }
   }
-  return { config: {}, path: null };
+  return { config: {}, path: explicitPath ?? null };
 }
 
 async function readConfigFile(path: string, options: ConfigOptions): Promise<Record<string, unknown> | null> {
@@ -198,8 +218,7 @@ async function readConfigFile(path: string, options: ConfigOptions): Promise<Rec
 
 async function saveConfigFile(path: string, config: Record<string, unknown>, options: ConfigOptions): Promise<void> {
   const fs = options.fs ?? nodeFs;
-  await fs.mkdir(dirname(path), { recursive: true });
-  await fs.writeFile(path, YAML.stringify(config, { sortMapEntries: true }), "utf8");
+  await fs.write(path, YAML.stringify(config, { sortMapEntries: true }));
 }
 
 function toMoodleConfig(config: Record<string, unknown>, baseUrl: string): MoodleConfig {
@@ -207,22 +226,13 @@ function toMoodleConfig(config: Record<string, unknown>, baseUrl: string): Moodl
   return { ...rest, baseUrl };
 }
 
-function defaultPrompt(options: ConfigOptions): (label: string) => Promise<string> {
-  return async (label: string): Promise<string> => {
-    const rl = createInterface({
-      input: process.stdin,
-      output: options.stdout ?? process.stdout,
-    });
-    try {
-      return await rl.question(`${label} > `);
-    } finally {
-      rl.close();
-    }
-  };
+function defaultPrompt(ui: Ui): (label: string) => Promise<string> {
+  return (label) => ui.text(label, { placeholder: "https://school.example.edu" });
 }
 
+// Only a person gets the setup prompt. An agent shell with a pty is told what to set instead.
 function isInteractive(options: ConfigOptions): boolean {
-  return Boolean((options.stdin ?? process.stdin).isTTY);
+  return Boolean((options.stdin ?? process.stdin).isTTY) && !isAgentEnvironment(options.env ?? process.env);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

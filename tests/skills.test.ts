@@ -74,15 +74,13 @@ describe("skills install wrappers", () => {
 
 describe("skill generation", () => {
   it("summarizes the skill entrypoint", () => {
-    expect(formatSkillSummary()).toContain("Generate: moodle skills generate");
+    expect(formatSkillSummary()).toContain("Install: npx skills add https://github.com/bunizao/moodle-cli");
+    expect(formatSkillSummary()).toContain("Moodle units");
   });
 
   it("extracts public commands from a commander-like tree", () => {
     const program = new Command("moodle");
     program.command("courses").description("List enrolled courses.").option("-j, --json", "Output as JSON.").option("--fields <fields>", "Keep only these fields.");
-    const internal = program.command("internal").description("Hidden command.");
-    (internal as unknown as { hidden: boolean }).hidden = true;
-
     const commands = extractCommanderCommands(program);
 
     expect(commands).toEqual([
@@ -92,8 +90,8 @@ describe("skill generation", () => {
         description: "List enrolled courses.",
         arguments: [],
         flags: [
-          { name: "--json", alias: "-j", description: "Output as JSON.", defaultValue: undefined, required: false },
-          { name: "--fields", alias: undefined, description: "Keep only these fields.", defaultValue: undefined, required: true },
+          { name: "--json", alias: "-j", description: "Output as JSON.", required: false },
+          { name: "--fields", alias: undefined, description: "Keep only these fields.", required: true },
         ],
       },
     ]);
@@ -139,18 +137,29 @@ describe("skill generation", () => {
     const program = new Command("moodle");
     program.command("todo").description("List upcoming actionable timeline items.").option("--limit <number>", "Maximum number of items.", "20");
     program.command("courses").description("List enrolled courses.").option("--json", "Output as JSON.");
+    program.command("download").alias("dl").description("Download one authenticated Moodle file.")
+      .argument("<source>")
+      .option("--dest <path>")
+      .option("--force");
 
     writeGeneratedSkill(program, join(targetDir, "SKILL.md"));
 
     const root = await readFile(join(targetDir, "SKILL.md"), "utf8");
     const commandReference = await readFile(join(targetDir, "references", "command-reference.md"), "utf8");
-    const outputReference = await readFile(join(targetDir, "references", "output-and-errors.md"), "utf8");
+    const downloadsReference = commandReference;
+    const outputReference = commandReference;
     const agentMetadata = await readFile(join(targetDir, "agents", "openai.yaml"), "utf8");
 
-    expect(root).toContain("references/deadlines-and-alerts.md");
+    expect(root).toContain("references/setup-and-auth.md");
     expect(root).toContain("references/command-reference.md");
     expect(commandReference).toContain("| moodle todo | List upcoming actionable timeline items. |");
+    expect(commandReference).toContain("| moodle download | Download one authenticated Moodle file. | <source> | --dest (value required)<br>--force |");
+    expect(downloadsReference).toContain("moodle download");
+    expect(downloadsReference).toContain("files");
+    expect(downloadsReference).toContain("--force");
+    expect(downloadsReference).toContain("whole");
     expect(outputReference).toContain("`--fields a,b,c` keeps only listed top-level fields");
     expect(agentMetadata).toContain('display_name: "Moodle CLI"');
+    expect(agentMetadata).toContain("retrieve authenticated course files");
   });
 });

@@ -1,46 +1,29 @@
-export type ErrorCode =
-  | "unexpected_error"
-  | "auth_failed"
-  | "config_error"
-  | "usage_error"
-  | "not_found"
-  | "api_error";
+import { CliError, type ErrorCode } from "@bunizao/cli-kit";
+import { RequestFailed } from "./session-fetch.js";
 
-export class CliError extends Error {
-  readonly code: ErrorCode;
-  readonly exitCode: number;
-  readonly hint?: string;
-
-  constructor(message: string, code: ErrorCode = "unexpected_error", exitCode = 1, hint?: string) {
-    super(message);
-    this.name = this.constructor.name;
-    this.code = code;
-    this.exitCode = exitCode;
-    this.hint = hint;
-  }
-}
+export { CliError, type ErrorCode } from "@bunizao/cli-kit";
 
 export class AuthError extends CliError {
   constructor(message: string, hint?: string) {
-    super(message, "auth_failed", 2, hint);
+    super("auth", message, hint);
   }
 }
 
 export class ConfigError extends CliError {
   constructor(message: string, hint?: string) {
-    super(message, "config_error", 2, hint);
+    super("config", message, hint);
   }
 }
 
 export class UsageError extends CliError {
   constructor(message: string, hint?: string) {
-    super(message, "usage_error", 3, hint);
+    super("usage", message, hint);
   }
 }
 
 export class NotFoundError extends CliError {
   constructor(message: string, hint?: string) {
-    super(message, "not_found", 4, hint);
+    super("not_found", message, hint);
   }
 }
 
@@ -48,24 +31,28 @@ export class MoodleAPIError extends CliError {
   readonly moodleErrorCode?: string;
 
   constructor(message: string, moodleErrorCode?: string) {
-    super(message, "api_error", 1);
+    const auth = isLoginErrorCode(moodleErrorCode);
+    const notFound = ["invalidrecord", "invalidcoursemodule"].includes(moodleErrorCode ?? "") || /\bHTTP 404\b/.test(message);
+    super(auth ? "auth" : notFound ? "not_found" : "upstream", message, auth ? "Run `moodle auth login`." : undefined);
     this.moodleErrorCode = moodleErrorCode;
   }
 }
 
 export function isLoginRequiredError(error: unknown): boolean {
-  if (!(error instanceof MoodleAPIError)) {
-    return false;
-  }
-  return ["servicerequireslogin", "sitepolicynotagreed"].includes(error.moodleErrorCode ?? "");
+  return error instanceof MoodleAPIError && isLoginErrorCode(error.moodleErrorCode);
 }
 
-export function toCliError(error: unknown): CliError {
-  if (error instanceof CliError) {
-    return error;
-  }
-  if (error instanceof Error) {
-    return new CliError(error.message);
-  }
-  return new CliError(String(error));
+export function errorCode(error: unknown): ErrorCode | undefined {
+  return error instanceof CliError ? error.code : undefined;
+}
+
+function isLoginErrorCode(code: string | undefined): boolean {
+  return ["servicerequireslogin", "sitepolicynotagreed"].includes(code ?? "");
+}
+
+/** Transport failures are their own class of problem, not a bad session. */
+export function asNetworkError(error: unknown): CliError | null {
+  return error instanceof RequestFailed
+    ? new CliError("network", error.message, "Check the connection or VPN, then retry.")
+    : null;
 }

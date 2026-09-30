@@ -1,8 +1,13 @@
 import { HTMLElement, parse } from "node-html-parser";
 import type {
+  FeedbackCriterion,
+  QuizAttempt,
+  QuizAttemptReview,
+  QuizQuestion,
   Activity,
   Assignment,
   CourseGrades,
+  FileEntry,
   Folder,
   ForumDiscussion,
   ForumDiscussionRef,
@@ -16,6 +21,41 @@ import type {
   Section,
 } from "./models.js";
 import { cleanText, htmlToStructuredContent, resolveUrl } from "./html-utils.js";
+
+export interface MoodlePageError {
+  message: string;
+  code?: string;
+}
+
+export function parseMoodleErrorHtml(html: string): MoodlePageError | null {
+  const root = parse(html);
+  const messageNode = first(root, [
+    ".errormessage",
+    ".alert-danger .alert-message",
+    "[data-region='error-message']",
+    ".alert-danger[role='alert']",
+    ".alert-danger",
+  ]);
+  if (!messageNode) {
+    return null;
+  }
+
+  const messageRoot = parse(messageNode.toString());
+  for (const unwanted of messageRoot.querySelectorAll(
+    "button, .close, .errorcode, .stacktrace, .debuginfo, .backtrace, a.alert-link, a[href*='/error/']",
+  )) {
+    unwanted.remove();
+  }
+  const message = cleanText(messageRoot.textContent);
+  if (!message) {
+    return null;
+  }
+
+  const errorCodeText = cleanNodeText(root.querySelector(".errorcode"));
+  const errorCode = errorCodeText.match(/^error\s+code\s*:\s*([a-z][a-z0-9_]*)\s*$/iu)?.[1]
+    ?? moodleDocsErrorCode(root);
+  return { message, ...(errorCode ? { code: errorCode } : {}) };
+}
 
 export function parsePageContext(html: string, baseUrl: string): PageContext {
   const root = parse(html);
@@ -33,6 +73,7 @@ export function parsePageContext(html: string, baseUrl: string): PageContext {
       fullname: cleanNodeText(root.querySelector(".userfullname")),
       sitename: extractSitename(root),
       siteurl: baseUrl,
+      ...(config.timezone ? { timezone: stringValue(config.timezone) } : {}),
       lang: stringValue(config.language) || root.querySelector("html")?.getAttribute("lang") || "",
     },
   };
@@ -69,13 +110,14 @@ export function parseCourseContentsHtml(html: string, baseUrl: string): Section[
       }
       const classes = (activityElement.getAttribute("class") ?? "").split(/\s+/).filter(Boolean);
       const modname = classes.find((item) => item.startsWith("modtype_"))?.slice("modtype_".length) ?? "";
-      const name = cleanNodeText(
-        firstDefined([
-          activityElement.querySelector(".activityname .instancename"),
-          activityElement.querySelector(".activityname"),
-          activityElement.querySelector("a.aalink"),
-        ]),
-      );
+      const nameNode = firstDefined([
+        activityElement.querySelector(".activityname .instancename"),
+        activityElement.querySelector(".activityname"),
+        activityElement.querySelector("a.aalink"),
+      ]);
+      // Screen-reader text ("File", "Folder") sits inside the name on the page.
+      for (const hidden of nameNode?.querySelectorAll(".accesshide") ?? []) hidden.remove();
+      const name = cleanNodeText(nameNode);
       if (!name) {
         continue;
       }
@@ -103,9 +145,11 @@ export function parseCourseContentsHtml(html: string, baseUrl: string): Section[
 
 export function parseCourseSectionNumbers(html: string, courseId: number): number[] {
   const sections: number[] = [];
-  const pattern = /href=["']([^"']*\/course\/view\.php\?[^"']*)["']/g;
-  for (const match of html.matchAll(pattern)) {
-    const url = parseMaybeUrl(match[1], "https://moodle.invalid");
+  const root = parse(html.replace(/&section=/gu, "&amp;section="));
+  const hrefs = root.querySelectorAll('a[href*="/course/view.php"]')
+    .map((link) => link.getAttribute("href") ?? "");
+  for (const href of hrefs) {
+    const url = parseMaybeUrl(href.replace(/&amp;/gu, "&"), "https://moodle.invalid");
     const id = url?.searchParams.get("id");
     const sectionValue = url?.searchParams.get("section");
     if (id === String(courseId) && sectionValue && /^\d+$/.test(sectionValue)) {
@@ -227,6 +271,8 @@ export function parseGradeOverviewRows(html: string, baseUrl: string): Record<nu
 }
 
 export function parseAssignmentHtml(html: string, assignmentId: number, baseUrl: string): Assignment {
+  const root = parse(html);
+  const feedback = root.querySelector(".feedback");
   return {
     id: assignmentId,
     name: pageTitle(html),
@@ -236,25 +282,56 @@ export function parseAssignmentHtml(html: string, assignmentId: number, baseUrl:
     grading_status: findTableValue(html, "Grading status"),
     time_remaining: findTableValue(html, "Time remaining"),
     grade: findTableValue(html, "Grade"),
-    submission_files: parseAssignmentSubmissionFiles(html, baseUrl).map((file) => file.name),
+    graded_on: feedback ? findTableValue(feedback.toString(), "Graded on") : "",
+    graded_by: feedback ? findTableValue(feedback.toString(), "Graded by") : "",
+    feedback_comments: feedback ? findTableValue(feedback.toString(), "Feedback comments") : "",
+    criteria: feedback ? parseFeedbackCriteria(feedback) : [],
+    file_entries: [...parseIntroAttachments(root, baseUrl), ...(feedback ? parseFeedbackFiles(feedback, baseUrl) : [])],
     url: `${baseUrl.replace(/\/$/, "")}/mod/assign/view.php?id=${assignmentId}`,
   };
 }
 
-export function parseAssignmentSubmissionFiles(html: string, baseUrl: string): Array<{ name: string; url: string }> {
-  const root = parse(html);
-  const files: Array<{ name: string; url: string }> = [];
-  const seen = new Set<string>();
-  for (const link of root.querySelectorAll('table a[href*="pluginfile.php"]')) {
-    const name = cleanNodeText(link);
-    const url = resolveUrl(baseUrl, link.getAttribute("href") ?? "");
-    if (!name || !url || seen.has(url)) {
-      continue;
-    }
-    seen.add(url);
-    files.push({ name, url });
+// Rubrics and marking guides render the same tr.criterion rows but keep the
+// marker's choice in different cells: a rubric ticks one level, a guide types a score.
+function parseFeedbackCriteria(feedback: HTMLElement): FeedbackCriterion[] {
+  const criteria: FeedbackCriterion[] = [];
+  for (const row of feedback.querySelectorAll("tr.criterion")) {
+    const level = row.querySelector("td.level.checked");
+    const name = cleanNodeText(row.querySelector(".criterionshortname") ?? row.querySelector("td.description"));
+    if (!name) continue;
+    criteria.push({
+      name,
+      level: cleanNodeText(level?.querySelector(".definition")),
+      score: cleanNodeText(row.querySelector("td.score") ?? level?.querySelector(".score")),
+      remark: cleanTableCell(row.querySelector("td.remark")),
+    });
   }
-  return files;
+  return criteria;
+}
+
+// The teacher's files (spec, datasets) render in the same file tree markup as the
+// student's own submission, so the pluginfile file area is the only reliable marker.
+function parseIntroAttachments(root: HTMLElement, baseUrl: string): FileEntry[] {
+  const entries: FileEntry[] = [];
+  for (const link of root.querySelectorAll('a[href*="/mod_assign/introattachment/"]')) {
+    const url = resolveUrl(baseUrl, link.getAttribute("href") ?? "");
+    const name = cleanNodeText(link) || decodeURIComponent(new URL(url).pathname.split("/").at(-1) || "file");
+    if (!entries.some((entry) => entry.url === url)) entries.push(fileEntry(name, url, baseUrl));
+  }
+  return entries;
+}
+
+// Feedback files and annotated PDFs both arrive as plain pluginfile links in the feedback table.
+function parseFeedbackFiles(feedback: HTMLElement, baseUrl: string): FileEntry[] {
+  const entries: FileEntry[] = [];
+  for (const link of feedback.querySelectorAll('a[href*="pluginfile.php"]')) {
+    const url = resolveUrl(baseUrl, link.getAttribute("href") ?? "");
+    // "View annotated PDF..." is a prompt, not a name; the path carries the real filename.
+    const label = cleanNodeText(link);
+    const name = /\.\w{1,5}$/u.test(label) ? label : decodeURIComponent(new URL(url).pathname.split("/").at(-1) || "file");
+    if (!entries.some((entry) => entry.url === url)) entries.push(fileEntry(name, url, baseUrl));
+  }
+  return entries;
 }
 
 export function parseQuizHtml(html: string, quizId: number, baseUrl: string): Quiz {
@@ -265,22 +342,113 @@ export function parseQuizHtml(html: string, quizId: number, baseUrl: string): Qu
     ...activityContext(html),
     opens_pretty: extractLabeledText(html, "Opens:"),
     closes_pretty: extractLabeledText(html, "Closes:"),
-    attempts_allowed: cleanText(root.textContent.match(/Attempts allowed:\s*([^\n]+)/i)?.[1] ?? ""),
+    attempts_allowed: labeledParagraph(root, "Attempts allowed:"),
+    time_limit: labeledParagraph(root, "Time limit:"),
     availability: cleanText(root.textContent.match(/This quiz is currently[^\n]+/i)?.[0] ?? ""),
     grade: findTableValue(html, "Grade"),
+    attempts: parseQuizAttempts(root, baseUrl),
     url: `${baseUrl.replace(/\/$/, "")}/mod/quiz/view.php?id=${quizId}`,
   };
+}
+
+// Quiz info lines are sibling paragraphs, so whole-page text runs them together.
+function labeledParagraph(root: HTMLElement, label: string): string {
+  for (const p of root.querySelectorAll("p")) {
+    const line = cleanNodeText(p);
+    if (line.startsWith(label)) return cleanText(line.slice(label.length));
+  }
+  return "";
+}
+
+// Each attempt is a card holding a summary table and a Review link; the attempt id
+// only exists in that link, so cards without one (an attempt still in progress) are skipped.
+function parseQuizAttempts(root: HTMLElement, baseUrl: string): QuizAttempt[] {
+  const attempts: QuizAttempt[] = [];
+  for (const table of root.querySelectorAll("table.quizreviewsummary")) {
+    const card = table.closest(".card") ?? table.parentNode;
+    const link = card?.querySelector('a[href*="/mod/quiz/review.php"]');
+    const reviewUrl = link ? resolveUrl(baseUrl, link.getAttribute("href") ?? "") : "";
+    const id = numberQueryValue(reviewUrl, "attempt");
+    if (!link || id === null) continue;
+    const summary = tableValues(table);
+    const number = Number(cleanNodeText(card?.querySelector(".card-title")).match(/\d+/)?.[0] ?? attempts.length + 1);
+    attempts.push({ id, number, status: summary.Status ?? "", started: summary.Started ?? "", completed: summary.Completed ?? "", duration: summary.Duration ?? "", marks: summary.Marks ?? "", grade: summary.Grade ?? "", review_url: reviewUrl });
+  }
+  return attempts;
+}
+
+export function parseQuizReviewHtml(html: string, attemptId: number, baseUrl: string): QuizAttemptReview {
+  const root = parse(html);
+  const summary = tableValues(root.querySelector("table.quizreviewsummary"));
+  const form = root.querySelector("form.questionflagsaveform");
+  const url = `${baseUrl.replace(/\/$/, "")}/mod/quiz/review.php?attempt=${attemptId}`;
+  return {
+    id: attemptId,
+    quiz_id: numberQueryValue(form?.getAttribute("action") ?? "", "cmid") ?? 0,
+    course_id: parseCourseIdFromPageHtml(html) ?? 0,
+    status: summary.Status ?? "",
+    started: summary.Started ?? "",
+    completed: summary.Completed ?? "",
+    duration: summary.Duration ?? "",
+    marks: summary.Marks ?? "",
+    grade: summary.Grade ?? "",
+    questions: root.querySelectorAll("div.que").map(parseQuizQuestion),
+    url,
+  };
+}
+
+// The question type is the second class on div.que ("que multichoice deferredfeedback complete").
+function parseQuizQuestion(que: HTMLElement): QuizQuestion {
+  const answer = que.querySelector(".answer");
+  // Choice questions keep the learner's picks as checked inputs; free-text types print the text.
+  const picked = answer?.querySelectorAll("input:checked, input[checked]").map((input) => {
+    const label = input.getAttribute("aria-labelledby");
+    return cleanTableCell(label ? que.querySelector(`[id="${label}"]`) : input.parentNode);
+  }).filter(Boolean) ?? [];
+  // Short answers and numbers sit in a read-only input's value; the gap layout puts that input inside .qtext.
+  const typed = cleanText(que.querySelector('input[type="text"], input[type="number"]')?.getAttribute("value") ?? "");
+  const response = picked.length ? picked.join("; ") : typed || blockText(answer?.querySelector(".qtype_essay_response") ?? answer);
+  return {
+    number: Number(cleanNodeText(que.querySelector(".qno")) || 0),
+    type: que.classList.value[1] ?? "",
+    state: cleanNodeText(que.querySelector(".info .state")),
+    mark: cleanNodeText(que.querySelector(".info .grade")).replace(/^Mark\s+/u, ""),
+    text: blockText(que.querySelector(".qtext")),
+    response: response.replace(/\s*Word count: \d+$/u, ""),
+    correct: blockText(que.querySelector(".rightanswer")).replace(/^The correct answers? (?:is|are):?\s*/iu, "").replace(/^'(.*)'\.?$/u, "$1"),
+    feedback: blockText(que.querySelector(".outcome .feedback")),
+  };
+}
+
+// Essays and feedback are paragraphs; joining them without a break glues sentences together.
+export function blockText(node: HTMLElement | null | undefined): string {
+  if (!node) return "";
+  return cleanTableCell(parse(node.toString().replace(/<br\s*\/?>|<\/(?:p|div|li|h\d|tr)>/giu, "$& ")));
+}
+
+function tableValues(table: HTMLElement | null | undefined): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const row of table?.querySelectorAll("tr") ?? []) {
+    const cells = row.querySelectorAll("th, td");
+    if (cells.length >= 2) values[cleanNodeText(cells[0])] = cleanTableCell(cells[1]);
+  }
+  return values;
 }
 
 export function parseResourceHtml(html: string, resourceId: number, baseUrl: string): Resource {
   const root = parse(html);
   const link = root.querySelector(".resourceworkaround a[href], .resourcecontent a[href], a.resourceworkaround[href]");
+  const embed = root.querySelector(".resourcecontent iframe[src], .resourcecontent object[data], .resourcecontent embed[src]");
+  const rawUrl = link?.getAttribute("href") || embed?.getAttribute("src") || embed?.getAttribute("data") || "";
+  const targetUrl = rawUrl ? resolveUrl(baseUrl, rawUrl) : "";
+  const targetName = cleanNodeText(link) || (targetUrl ? decodeURIComponent(new URL(targetUrl).pathname.split("/").at(-1) || "file") : "");
   return {
     id: resourceId,
     name: pageTitle(html),
     ...activityContext(html),
-    target_name: cleanNodeText(link),
-    target_url: link ? resolveUrl(baseUrl, link.getAttribute("href") ?? "") : "",
+    target_name: targetName,
+    target_url: targetUrl,
+    file_entries: targetName && targetUrl ? [fileEntry(targetName, targetUrl, baseUrl)] : [],
     url: `${baseUrl.replace(/\/$/, "")}/mod/resource/view.php?id=${resourceId}`,
   };
 }
@@ -300,141 +468,33 @@ export function parseLinkHtml(html: string, linkId: number, baseUrl: string): Li
 export function parsePageHtml(html: string, pageId: number, baseUrl: string): Page {
   const root = parse(html);
   const content = first(root, [".box.generalbox", ".activity-description", "[data-region='page-content']", "main"]);
-  const contentHtml = content?.innerHTML ?? "";
-  const structured = htmlToStructuredContent(contentHtml, baseUrl);
   return {
     id: pageId,
     name: pageTitle(html),
     ...activityContext(html),
-    content_text: structured.text,
-    content_html: contentHtml,
-    image_urls: structured.image_urls,
-    links: structured.links,
-    tables: structured.tables,
-    files: pagePluginFiles(structured.links, structured.image_urls),
+    content_text: content ? htmlToStructuredContent(content.innerHTML, baseUrl).text : "",
     url: `${baseUrl.replace(/\/$/, "")}/mod/page/view.php?id=${pageId}`,
   };
 }
 
-function pagePluginFiles(
-  links: Array<{ text: string; url: string }>,
-  imageUrls: string[],
-): Array<{ name: string; url: string }> {
-  const files: Array<{ name: string; url: string }> = [];
-  const seen = new Set<string>();
-  for (const candidate of [
-    ...links.map((link) => ({ name: link.text, url: link.url })),
-    ...imageUrls.map((url) => ({ name: "", url })),
-  ]) {
-    if (!isPluginFileUrl(candidate.url)) {
-      continue;
-    }
-    const key = canonicalPluginFileUrl(candidate.url);
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    files.push({ name: filenameFromPluginFile(candidate.name, candidate.url), url: candidate.url });
-  }
-  return files;
-}
-
-function isPluginFileUrl(value: string): boolean {
-  try {
-    return new URL(value).pathname.startsWith("/pluginfile.php/");
-  } catch {
-    return false;
-  }
-}
-
-function canonicalPluginFileUrl(value: string): string {
-  const url = new URL(value);
-  url.searchParams.delete("forcedownload");
-  url.searchParams.sort();
-  return url.toString();
-}
-
-function filenameFromPluginFile(label: string, value: string): string {
-  const pathname = new URL(value).pathname;
-  const basename = decodeURIComponent(pathname.split("/").filter(Boolean).at(-1) ?? "");
-  return /\.[a-z0-9]{1,10}$/i.test(label.trim()) ? label.trim() : basename || label.trim() || "attachment";
-}
-
 export function parseFolderHtml(html: string, folderId: number, baseUrl: string): Folder {
   const root = parse(html);
-  const files = unique(root.querySelectorAll(".foldertree a[href], .fp-filename-icon a[href]").map((link) => cleanNodeText(link)).filter(Boolean));
+  const fileEntries = root.querySelectorAll(".foldertree a[href], .fp-filename-icon a[href]")
+    .map((link) => {
+      const name = cleanNodeText(link);
+      const url = resolveUrl(baseUrl, link.getAttribute("href") ?? "");
+      return name && url ? fileEntry(name, url, baseUrl) : null;
+    })
+    .filter((entry): entry is FileEntry => entry !== null)
+    .filter((entry, index, entries) => entries.findIndex((candidate) => candidate.url === entry.url) === index);
   return {
     id: folderId,
     name: pageTitle(html),
     ...activityContext(html),
-    files,
+    files: unique(fileEntries.map((entry) => entry.name)),
+    file_entries: fileEntries,
     url: `${baseUrl.replace(/\/$/, "")}/mod/folder/view.php?id=${folderId}`,
   };
-}
-
-export interface ScrapedForm {
-  action: string;
-  fields: Record<string, string>;
-}
-
-export function parseFormWithField(html: string, name: string, value: string, baseUrl: string): ScrapedForm | null {
-  const root = parse(html);
-  for (const form of root.querySelectorAll("form")) {
-    const marker = form.querySelector(`input[name="${name}"]`);
-    if (!marker || marker.getAttribute("value") !== value) {
-      continue;
-    }
-    const fields: Record<string, string> = {};
-    for (const input of form.querySelectorAll("input[type='hidden']")) {
-      const fieldName = input.getAttribute("name");
-      if (fieldName) {
-        fields[fieldName] = input.getAttribute("value") ?? "";
-      }
-    }
-    const action = form.getAttribute("action") ?? "";
-    return { action: action ? resolveUrl(baseUrl, action) : "", fields };
-  }
-  return null;
-}
-
-export function parseUploadRepositoryId(html: string): number {
-  const after = html.match(/"type":"upload"[^{}]*?"id":(\d+)/);
-  if (after) {
-    return Number(after[1]);
-  }
-  const before = html.match(/"id":(\d+)[^{}]*?"type":"upload"/);
-  return before ? Number(before[1]) : 0;
-}
-
-export function parseContextId(html: string): number {
-  const match = html.match(/"contextid":(\d+)/) ?? html.match(/"ctx_id":(\d+)/) ?? html.match(/"context":\{"id":(\d+)/);
-  return match ? Number(match[1]) : 0;
-}
-
-export function parseSubmissionStatement(html: string): string {
-  const root = parse(html);
-  const input = root.querySelector('input[name="submissionstatement"]');
-  if (!input) {
-    return "";
-  }
-  const container = input.parentNode as HTMLElement | null;
-  return cleanText(container?.textContent ?? "");
-}
-
-export function parseFolderFileLinks(html: string, baseUrl: string): Array<{ name: string; url: string }> {
-  const root = parse(html);
-  const files: Array<{ name: string; url: string }> = [];
-  const seen = new Set<string>();
-  for (const link of root.querySelectorAll(".foldertree a[href], .fp-filename-icon a[href]")) {
-    const name = cleanNodeText(link);
-    const url = resolveUrl(baseUrl, link.getAttribute("href") ?? "");
-    if (!name || !url || seen.has(url)) {
-      continue;
-    }
-    seen.add(url);
-    files.push({ name, url });
-  }
-  return files;
 }
 
 export function parseForumDiscussionHtml(html: string, baseUrl: string, discussionId: number): ForumDiscussion {
@@ -612,6 +672,17 @@ function selectedGroupName(root: HTMLElement, groupId: number): string {
   return "";
 }
 
+function moodleDocsErrorCode(root: HTMLElement): string | undefined {
+  for (const link of root.querySelectorAll("a[href*='/error/']")) {
+    const href = link.getAttribute("href") ?? "";
+    const code = href.match(/\/error\/[^/]+\/([a-z][a-z0-9_]*)/iu)?.[1];
+    if (code) {
+      return code;
+    }
+  }
+  return undefined;
+}
+
 function cleanNodeText(node: HTMLElement | null | undefined): string {
   return cleanText(node?.textContent ?? "");
 }
@@ -680,15 +751,18 @@ function pageTitle(html: string): string {
 function activityContext(html: string): { course_id: number; course_name: string; section_name: string } {
   const root = parse(html);
   const context = { course_id: parseCourseIdFromPageHtml(html) ?? 0, course_name: "", section_name: "" };
-  for (const link of root.querySelectorAll('nav[aria-label="Breadcrumb"] a[href], #page-navbar .breadcrumb a[href], a[href*="/course/view.php?id="]')) {
+  const breadcrumbs = root.querySelectorAll('nav[aria-label="Breadcrumb"] a[href], #page-navbar .breadcrumb a[href]');
+  const links = breadcrumbs.length ? breadcrumbs : root.querySelectorAll('a[href*="/course/view.php?id="]');
+  for (const link of links) {
     const href = link.getAttribute("href") ?? "";
     const courseId = numberQueryValue(href, "id");
     if (courseId !== null) {
       context.course_id = courseId;
-      context.course_name ||= cleanNodeText(link);
     }
-    if (numberQueryValue(href, "section") !== null) {
-      context.section_name ||= cleanNodeText(link);
+    if (numberQueryValue(href, "section") === null) {
+      context.course_name ||= cleanNodeText(link);
+    } else {
+      context.section_name = cleanNodeText(link);
     }
   }
   return context;
@@ -722,7 +796,7 @@ function cleanTableCell(node: HTMLElement | null | undefined): string {
     return "";
   }
   const clone = parse(node.toString());
-  for (const unwanted of clone.querySelectorAll(".action-menu, .dropdown, script, style")) {
+  for (const unwanted of clone.querySelectorAll(".action-menu, .dropdown, .hidden, .accesshide, script, style")) {
     unwanted.remove();
   }
   return cleanText(clone.textContent.replace("( Empty )", "(Empty)"));
@@ -748,6 +822,14 @@ function numberValue(value: unknown): number {
 
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : value == null ? "" : String(value);
+}
+
+function fileEntry(name: string, url: string, baseUrl: string): FileEntry {
+  return {
+    name,
+    url,
+    requires_authentication: new URL(url).origin === new URL(baseUrl).origin,
+  };
 }
 
 function unique<T>(items: T[]): T[] {

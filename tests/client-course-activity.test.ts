@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { runCli } from "../src/cli";
 import { MoodleAPIError, MoodleClient, type AjaxCall } from "../src/client";
 import { ENV_MOODLE_BASE_URL, ENV_MOODLE_SESSION } from "../src/constants";
+import { parseAssignmentHtml, parseCourseContentsHtml, parseQuizReviewHtml } from "../src/scraper";
 import { resolveCourseReference, parseActivityReference, resolveTopLevelUrl } from "../src/url-resolver";
 
 const BASE_URL = "https://school.example.edu";
@@ -114,10 +115,10 @@ describe("MoodleClient course/activity modules", () => {
       { id: 202, shortname: "MATH102", fullname: "Mathematics 102", category: 4, visible: false, startdate: 1700000100 },
     ]);
     expect(resolveCourseReference("101", courses)).toBe(101);
-    expect(resolveCourseReference("102", courses)).toBe(102);
+    expect(resolveCourseReference("202", courses)).toBe(202);
     expect(resolveCourseReference("MATH101", courses)).toBe(101);
-    expect(() => resolveCourseReference("Mathematics", courses)).toThrow(/ambiguous/i);
-    expect(() => resolveCourseReference("Physics", courses)).toThrow(/Could not find/);
+    expect(() => resolveCourseReference("Mathematics", courses)).toThrow(/Several units match/i);
+    expect(() => resolveCourseReference("Physics", courses)).toThrow(/No unit matches/);
   });
 
   it("falls back to the timeline courses API when the primary course API is unavailable", async () => {
@@ -144,7 +145,172 @@ describe("MoodleClient course/activity modules", () => {
     const courses = await client.getCourses();
 
     expect(courses).toHaveLength(2);
-    expect(seen.filter((request) => request.init?.method === "POST")).toHaveLength(3);
+    // A short timeline page ends the listing without asking for an empty one.
+    expect(seen.filter((request) => request.init?.method === "POST")).toHaveLength(2);
+  });
+
+  it("remembers disabled services, answers them locally, and keeps batches whole", async () => {
+    const { seen } = installFetch([
+      dashboardRoute,
+      (request) => {
+        if (request.init?.method !== "POST") return undefined;
+        const body = JSON.parse(String(request.init.body)) as AjaxCall[];
+        const methods = body.map((call) => call.methodname);
+        if (methods.includes("core_enrol_get_users_courses")) {
+          return jsonResponse([{ index: 0, error: true, exception: { message: "Web service is not available", errorcode: "servicenotavailable" } }]);
+        }
+        if (methods[0] === "core_course_get_enrolled_courses_by_timeline_classification") {
+          return jsonResponse([{ index: 0, error: false, data: { courses: jsonFixture("courses.json"), nextoffset: 100 } }]);
+        }
+        if (methods[0] === "core_calendar_get_action_events_by_timesort") {
+          return jsonResponse([
+            { index: 0, error: false, data: todoPayload() },
+            { index: 1, error: false, data: alertBatch()[0].data },
+            { index: 2, error: false, data: alertBatch()[1].data },
+            { index: 3, error: false, data: alertBatch()[2].data },
+          ]);
+        }
+        return undefined;
+      },
+    ]);
+    const snapshots: Array<Record<string, unknown>> = [];
+    const options = { cookie: { name: "MoodleSession", value: "session" }, sesskey: "sess", userid: 7, userInfo: { userid: 7, username: "", fullname: "Alice Example", sitename: "Example", siteurl: BASE_URL, lang: "" } };
+    const first = new MoodleClient(BASE_URL, { ...options, writeSessionCache: async (snapshot) => { snapshots.push(snapshot as unknown as Record<string, unknown>); } });
+    await first.getCourses();
+    expect(snapshots.at(-1)).toMatchObject({ unavailable: ["core_enrol_get_users_courses"], user: { fullname: "Alice Example" } });
+
+    seen.length = 0;
+    const second = new MoodleClient(BASE_URL, { ...options, unavailable: ["core_enrol_get_users_courses", "core_webservice_get_site_info"] });
+    const overview = await second.getOverview(5, 14, 5);
+    const posted = seen.filter((request) => request.init?.method === "POST").map((request) => new URL(request.url).searchParams.get("info"));
+    // The dead function never travels, so the remaining four ride in one batch and the profile comes from the cache.
+    expect(posted).toEqual([
+      "core_calendar_get_action_events_by_timesort,message_popup_get_popup_notifications,core_message_get_conversation_counts,core_message_get_unread_conversation_counts",
+      "core_course_get_enrolled_courses_by_timeline_classification",
+    ]);
+    expect(overview.user.fullname).toBe("Alice Example");
+    expect(overview.courses).toHaveLength(2);
+    expect(overview.todo.length).toBeGreaterThan(0);
+    expect(seen.some((request) => request.url === `${BASE_URL}/my/`)).toBe(false);
+  });
+
+  it("keeps overview sources independent when Moodle truncates a failed batch", async () => {
+    installFetch([
+      (request) => {
+        if (request.init?.method !== "POST") return undefined;
+        const body = JSON.parse(String(request.init.body)) as AjaxCall[];
+        const methods = body.map((call) => call.methodname);
+        if (methods.length > 1 && methods[0] === "core_enrol_get_users_courses") {
+          return jsonResponse([{
+            index: 0,
+            error: true,
+            exception: { message: "Web service is not available", errorcode: "servicenotavailable" },
+          }]);
+        }
+        if (methods[0] === "core_webservice_get_site_info") {
+          return jsonResponse([{ index: 0, error: false, data: {
+            userid: 7,
+            fullname: "Alice Example",
+            sitename: "Example Moodle",
+            siteurl: BASE_URL,
+          } }]);
+        }
+        if (methods[0] === "core_enrol_get_users_courses") {
+          return jsonResponse([{
+            index: 0,
+            error: true,
+            exception: { message: "Web service is not available", errorcode: "servicenotavailable" },
+          }]);
+        }
+        if (methods[0] === "core_course_get_enrolled_courses_by_timeline_classification") {
+          const offset = body[0]?.args?.offset;
+          return jsonResponse([{ index: 0, error: false, data: {
+            courses: offset === 0 ? jsonFixture("courses.json") : [],
+            nextoffset: 100,
+          } }]);
+        }
+        if (methods[0] === "core_calendar_get_action_events_by_timesort") {
+          return jsonResponse([{ index: 0, error: false, data: todoPayload() }]);
+        }
+        if (methods.join(",") === "message_popup_get_popup_notifications,core_message_get_conversation_counts,core_message_get_unread_conversation_counts") {
+          return jsonResponse(alertBatch());
+        }
+        return undefined;
+      },
+    ]);
+    const client = new MoodleClient(BASE_URL, {
+      cookie: { name: "MoodleSession", value: "session" },
+      sesskey: "sess",
+      userid: 7,
+    });
+
+    const overview = await client.getOverview(5, 14, 5);
+
+    expect(overview.user.fullname).toBe("Alice Example");
+    expect(overview.courses).toHaveLength(2);
+    expect(overview.todo).toHaveLength(1);
+    expect(overview.alerts).toMatchObject({ direct_message_count: 2 });
+    expect(overview.errors).toEqual([]);
+  });
+
+  it("drops screen-reader text from activity names on a course page", () => {
+    const html = `<li id="section-1" class="section course-section main" data-for="section" data-id="11" data-number="1"><h3 class="sectionname">Week 1</h3><ul class="section">
+      <li class="activity activity-wrapper resource modtype_resource" id="module-5" data-for="cmitem" data-id="5"><div class="activityname"><a href="${BASE_URL}/mod/resource/view.php?id=5"><span class="instancename">Lecture slides <span class="accesshide"> File</span></span></a></div></li></ul></li>`;
+    expect(parseCourseContentsHtml(html, BASE_URL)[0].activities[0].name).toBe("Lecture slides");
+  });
+
+  it("lists an assignment's attached files before any feedback files", () => {
+    const tree = (href: string, name: string) => `<li><div class="fileuploadsubmission"><a target="_blank" href="${href}">${name}</a></div></li>`;
+    const html = `<title>Task: Assignment 2</title><div class="activity-description" id="intro"><ul>
+      ${tree(`${BASE_URL}/pluginfile.php/9/mod_assign/introattachment/0/Brief%20(v2).pdf?forcedownload=1`, "Brief (v2).pdf")}
+      ${tree(`${BASE_URL}/pluginfile.php/9/mod_assign/introattachment/0/data.csv?forcedownload=1`, "data.csv")}
+    </ul></div>
+    <table>${tree(`${BASE_URL}/pluginfile.php/9/assignsubmission_file/submission_files/5/mine.pdf?forcedownload=1`, "mine.pdf")}</table>`;
+    expect(parseAssignmentHtml(html, 33, BASE_URL).file_entries.map(f => f.name)).toEqual(["Brief (v2).pdf", "data.csv"]);
+  });
+
+  it("reads marker feedback, marking guide rows and feedback files from a graded assignment", () => {
+    const graded = parseAssignmentHtml(fixture("assign-graded.html"), 31, BASE_URL);
+    expect(graded).toMatchObject({
+      grade: "2.50 / 3.00",
+      graded_on: "Sunday, 12 May 2026, 12:08 PM",
+      graded_by: "Dana Marker",
+      feedback_comments: "Clear argument. Cite the lecture notes next time.",
+      criteria: [
+        { name: "Q1", level: "", score: "1 / 1", remark: "" },
+        { name: "Q2", level: "", score: "1.5 / 2", remark: "- [definition almost correct]: the second probability is a detection rate" },
+      ],
+    });
+    expect(graded.file_entries.map((file) => file.name)).toEqual(["essay-marked.pdf", "combined.pdf"]);
+    expect(graded.file_entries.every((file) => file.requires_authentication)).toBe(true);
+
+    const rubric = parseAssignmentHtml(fixture("assign-rubric.html"), 32, BASE_URL);
+    expect(rubric.criteria).toEqual([
+      { name: "Structure", level: "Clear sections with a summary", score: "4 points", remark: "Good flow." },
+      { name: "Analysis", level: "Partial", score: "3 points", remark: "" },
+    ]);
+  });
+
+  it("reads a short answer from the review's read-only input", () => {
+    const html = fixture("quiz-review.html").replace(
+      /<div id="question-1-3" class="que truefalse[\s\S]*?<div class="answer">[\s\S]*?<\/div>/u,
+      '<div id="question-1-3" class="que shortanswer deferredfeedback correct"><div class="info"><span class="qno">3</span><div class="state">Correct</div></div><div class="qtext">Capital of France?</div><div class="answer"><input type="text" name="q1:3_answer" value="Paris" readonly="readonly"></div>',
+    );
+    const review = parseQuizReviewHtml(html, 777, BASE_URL);
+    expect(review.questions[2]).toMatchObject({ type: "shortanswer", response: "Paris" });
+    // The gap layout puts the input inside the question text and has no .answer block at all.
+    const gap = html.replace('<div class="qtext">Capital of France?</div><div class="answer"><input type="text" name="q1:3_answer" value="Paris" readonly="readonly"></div>', '<div class="qtext">The capital of France is <input type="text" name="q1:3_answer" value="Paris" readonly="readonly">.</div>');
+    expect(parseQuizReviewHtml(gap, 777, BASE_URL).questions[2].response).toBe("Paris");
+  });
+
+  it("reads a quiz attempt review question by question", () => {
+    const review = parseQuizReviewHtml(fixture("quiz-review.html"), 777, BASE_URL);
+    expect(review).toMatchObject({ id: 777, quiz_id: 32, course_id: 101, status: "Finished", marks: "2.00/3.00", grade: "6.67 out of 10.00 (67%)" });
+    expect(review.questions).toEqual([
+      { number: 1, type: "essay", state: "Complete", mark: "", text: "Reflect on the exercise (350 words). Keep an academic tone.", response: "I argued against a full ban. Next time I will pause before answering.", correct: "", feedback: "" },
+      { number: 2, type: "multichoice", state: "Correct", mark: "1.00 out of 1.00", text: "Which assumptions are least compatible? (Select all that apply)", response: "a. Validity is independent of consequences.; c. Interpretation should not vary.", correct: "Validity is independent of consequences., Interpretation should not vary.", feedback: "Well spotted. Relational knowledge ties validity to use." },
+      { number: 3, type: "truefalse", state: "Incorrect", mark: "0.00 out of 1.00", text: "Echo chambers only form online.", response: "True", correct: "False", feedback: "No: value frameworks do this offline too." },
+    ]);
   });
 
   it("loads course contents through AJAX and exposes a flattened activity list", async () => {
@@ -158,10 +324,312 @@ describe("MoodleClient course/activity modules", () => {
     expect(activities.map((activity) => activity.name)).toEqual(["Syllabus", "Quiz 1"]);
   });
 
+  it("falls back to the modern course-format state service", async () => {
+    installFetch([
+      dashboardRoute,
+      ajaxErrorRoute("core_course_get_contents"),
+      ajaxRoute("core_courseformat_get_state", JSON.stringify({
+        section: [
+          { id: "11", section: 1, title: "Week 1", cmlist: ["21", "22"], visible: true },
+          { id: "12", section: 2, title: "Week 2", cmlist: ["23"], visible: false },
+          { id: "13", section: 3, title: "Week 3", cmlist: [], visible: true, parentid: "11", parentsectionid: null },
+        ],
+        cm: [
+          { id: "21", name: "Syllabus", sectionid: "11", module: "resource", url: `${BASE_URL}/mod/resource/view.php?id=21`, visible: true, uservisible: true },
+          { id: "22", name: "Quiz 1", sectionid: "11", plugin: "mod_quiz", url: "/mod/quiz/view.php?id=22", visible: true, uservisible: true, accessvisible: false },
+          { id: "23", name: "Hidden page", sectionid: "12", module: "page", url: "/mod/page/view.php?id=23", visible: false, uservisible: false },
+          { id: "24", name: "Omitted activity", sectionid: "13", module: "label", visible: true, uservisible: true },
+        ],
+      })),
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    const sections = await client.getCourseContents(101);
+
+    expect(sections).toEqual([
+      {
+        id: 11,
+        name: "Week 1",
+        section: 1,
+        visible: true,
+        summary: "",
+        activities: [
+          { id: 21, name: "Syllabus", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=21`, visible: true, description: "" },
+          { id: 22, name: "Quiz 1", modname: "quiz", url: `${BASE_URL}/mod/quiz/view.php?id=22`, visible: true, description: "" },
+        ],
+      },
+      {
+        id: 12,
+        name: "Week 2",
+        section: 2,
+        visible: false,
+        summary: "",
+        activities: [
+          { id: 23, name: "Hidden page", modname: "page", url: `${BASE_URL}/mod/page/view.php?id=23`, visible: false, description: "" },
+        ],
+      },
+      {
+        id: 13,
+        name: "Week 3",
+        section: 3,
+        visible: true,
+        summary: "",
+        parent: 11,
+        activities: [],
+      },
+    ]);
+  });
+
+  it("uses the module course hint instead of scanning every enrolled course", async () => {
+    const courses = Array.from({ length: 30 }, (_, index) => ({
+      id: 101 + index,
+      shortname: `C${index + 1}`,
+      fullname: `Course ${index + 1}`,
+      category: 1,
+      visible: true,
+      startdate: 0,
+    }));
+    const { seen } = installFetch([
+      dashboardRoute,
+      ajaxRoute("core_course_get_course_module", { cm: { id: 24, course: 101, modname: "lti" } }),
+      ajaxRoute("core_course_get_contents", [{
+        id: 11,
+        name: "Week 1",
+        section: 1,
+        visible: true,
+        summary: "",
+        modules: [{ id: 24, name: "Reading list", modname: "lti", url: `${BASE_URL}/mod/lti/view.php?id=24`, visible: true }],
+      }]),
+      ajaxRoute("core_enrol_get_users_courses", courses),
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    await expect(client.getActivity(24)).resolves.toMatchObject({ id: 24, name: "Reading list", type: "lti" });
+
+    const methods = seen.filter((request) => request.init?.method === "POST")
+      .flatMap((request) => (JSON.parse(String(request.init?.body)) as AjaxCall[]).map((call) => call.methodname));
+    expect(methods).toEqual(["core_course_get_course_module", "core_course_get_contents"]);
+  });
+
+  it("describes the activity a shortcut plugin redirects to, and never fetches standard module pages", async () => {
+    const modules: Record<number, string> = { 24: "shadow", 31: "lti" };
+    installFetch([
+      dashboardRoute,
+      (request) => {
+        const url = new URL(request.url);
+        if (request.init?.method !== "POST" || !url.searchParams.get("info")?.includes("core_course_get_course_module")) return undefined;
+        const [call] = JSON.parse(String(request.init.body)) as AjaxCall[];
+        const cmid = Number(call.args?.cmid);
+        return jsonResponse([{ index: 0, error: false, data: { cm: { id: cmid, course: 101, modname: modules[cmid] } } }]);
+      },
+      (request) => request.url === `${BASE_URL}/mod/shadow/view.php?id=24`
+        ? new Response(null, { status: 303, headers: { location: `${BASE_URL}/mod/lti/view.php?id=31` } })
+        : undefined,
+      // Real fetch reports the URL it answered for; a constructed Response does not.
+      (request) => request.url === `${BASE_URL}/mod/lti/view.php?id=31`
+        ? Object.defineProperty(htmlResponse("<html></html>"), "url", { value: request.url })
+        : undefined,
+      ajaxRoute("core_course_get_contents", [{
+        id: 11,
+        name: "Week 1",
+        section: 1,
+        visible: true,
+        summary: "",
+        modules: [
+          { id: 24, name: "Essay", modname: "shadow", url: `${BASE_URL}/mod/shadow/view.php?id=24`, visible: true },
+          { id: 31, name: "Essay", modname: "lti", url: `${BASE_URL}/mod/lti/view.php?id=31`, visible: true },
+        ],
+      }]),
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    await expect(client.getActivity(24)).resolves.toMatchObject({ id: 31, name: "Essay", type: "lti" });
+  });
+
+  it("returns not found when one unrelated course cannot be searched", async () => {
+    installFetch([
+      dashboardRoute,
+      ajaxErrorRoute("core_course_get_course_module"),
+      ajaxRoute("core_enrol_get_users_courses", [
+        { id: 101, shortname: "C1", fullname: "Course 1", category: 1, visible: true, startdate: 0 },
+        { id: 102, shortname: "C2", fullname: "Course 2", category: 1, visible: true, startdate: 0 },
+      ]),
+      (request) => {
+        if (!request.url.includes("core_course_get_contents")) return undefined;
+        const body = JSON.parse(String(request.init?.body)) as AjaxCall[];
+        return jsonResponse(body.map((call, index) => call.args?.courseid === 101
+          ? { index, error: true, exception: { message: "Course access denied", errorcode: "accessexception" } }
+          : { index, error: false, data: [] }));
+      },
+      ajaxRoute("core_courseformat_get_state", JSON.stringify({
+        section: [{ id: "11", section: 1, title: "Week 1", cmlist: [] }],
+        cm: [],
+      })),
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    await expect(client.getActivity(999)).rejects.toThrow(
+      "Activity 999 was not found in the authenticated user's courses.",
+    );
+  });
+
+  it("batches activity discovery across every enrolled course", async () => {
+    const courses = Array.from({ length: 25 }, (_, index) => ({
+      id: 101 + index,
+      shortname: `C${index + 1}`,
+      fullname: `Course ${index + 1}`,
+      category: 1,
+      visible: true,
+      startdate: 0,
+    }));
+    const { seen } = installFetch([
+      dashboardRoute,
+      ajaxErrorRoute("core_course_get_course_module"),
+      ajaxRoute("core_enrol_get_users_courses", courses),
+      (request) => {
+        if (!request.url.includes("core_course_get_contents")) return undefined;
+        const body = JSON.parse(String(request.init?.body)) as AjaxCall[];
+        return jsonResponse(body.map((call, index) => ({
+          index,
+          error: false,
+          data: call.args?.courseid === 125
+            ? [{
+                id: 11,
+                name: "Week 1",
+                section: 1,
+                visible: true,
+                summary: "",
+                modules: [{ id: 999, name: "Late course activity", modname: "lti", url: "", visible: true }],
+              }]
+            : [],
+        })));
+      },
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    await expect(client.getActivity(999)).resolves.toMatchObject({
+      id: 999,
+      name: "Late course activity",
+      type: "lti",
+    });
+
+    const courseRequests = seen.filter((request) => request.url.includes("core_course_get_contents"));
+    expect(courseRequests).toHaveLength(2);
+  });
+
+  it("recovers omitted and reordered batch entries through course-format state", async () => {
+    const courses = Array.from({ length: 3 }, (_, index) => ({
+      id: 101 + index,
+      shortname: `C${index + 1}`,
+      fullname: `Course ${index + 1}`,
+      category: 1,
+      visible: true,
+      startdate: 0,
+    }));
+    const { seen } = installFetch([
+      dashboardRoute,
+      ajaxErrorRoute("core_course_get_course_module"),
+      ajaxRoute("core_enrol_get_users_courses", courses),
+      (request) => request.url.includes("core_course_get_contents")
+        ? jsonResponse([
+            { index: 2, error: false, data: [] },
+            { index: 1, error: false, data: [] },
+          ])
+        : undefined,
+      (request) => {
+        if (!request.url.includes("core_courseformat_get_state")) return undefined;
+        const body = JSON.parse(String(request.init?.body)) as AjaxCall[];
+        return jsonResponse(body.map((call, index) => {
+          const courseId = Number(call.args?.courseid);
+          const hasTarget = courseId === 101;
+          return {
+            index,
+            error: false,
+            data: JSON.stringify({
+              section: [{ id: String(courseId), section: 1, title: "Week 1", cmlist: hasTarget ? ["999"] : [] }],
+              cm: hasTarget
+                ? [{ id: "999", sectionid: String(courseId), module: "lesson", name: "Late lesson", visible: true, uservisible: true }]
+                : [],
+            }),
+          };
+        }));
+      },
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    await expect(client.getActivity(999)).resolves.toMatchObject({
+      id: 999,
+      name: "Late lesson",
+      type: "lesson",
+    });
+
+    expect(seen.filter((request) => request.url.includes("core_course_get_contents"))).toHaveLength(1);
+    expect(seen.filter((request) => request.url.includes("core_courseformat_get_state"))).toHaveLength(1);
+    const stateRequest = seen.find((request) => request.url.includes("core_courseformat_get_state"));
+    const stateCalls = JSON.parse(String(stateRequest?.init?.body)) as AjaxCall[];
+    expect(stateCalls.map((call) => call.args?.courseid)).toEqual([101]);
+  });
+
+  it("stops activity discovery when a batched course request reports session expiry", async () => {
+    const { seen } = installFetch([
+      dashboardRoute,
+      ajaxErrorRoute("core_course_get_course_module"),
+      ajaxRoute("core_enrol_get_users_courses", [
+        { id: 101, shortname: "C1", fullname: "Course 1", category: 1, visible: true, startdate: 0 },
+        { id: 102, shortname: "C2", fullname: "Course 2", category: 1, visible: true, startdate: 0 },
+      ]),
+      (request) => request.url.includes("core_course_get_contents")
+        ? jsonResponse([
+            { index: 0, error: true, exception: { message: "Session expired", errorcode: "servicerequireslogin" } },
+            { index: 1, error: false, data: [] },
+          ])
+        : undefined,
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    await expect(client.getActivity(999)).rejects.toMatchObject({
+      moodleErrorCode: "servicerequireslogin",
+    });
+    expect(seen.some((request) => request.url.includes("core_courseformat_get_state"))).toBe(false);
+  });
+
+  it("resolves activity details through course contents when module lookup is disabled", async () => {
+    installFetch([
+      dashboardRoute,
+      ajaxErrorRoute("core_course_get_course_module"),
+      ajaxRoute("core_enrol_get_users_courses", [(jsonFixture("courses.json") as unknown[])[0]]),
+      ajaxRoute("core_course_get_contents", [{
+        id: 11,
+        name: "Week 1",
+        section: 1,
+        visible: true,
+        summary: "",
+        modules: [
+          { id: 21, name: "Syllabus", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=21`, visible: true },
+          { id: 24, name: "Reading list", modname: "lti", url: `${BASE_URL}/mod/lti/view.php?id=24`, visible: true },
+        ],
+      }]),
+      (request) => (request.url === `${BASE_URL}/mod/resource/view.php?id=21` ? htmlResponse(fixture("resource.html")) : undefined),
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    await expect(client.getActivity(21)).resolves.toMatchObject({ id: 21, type: "resource", target_name: "slides.pdf" });
+    await expect(client.getActivity(24)).resolves.toEqual({
+      id: 24,
+      name: "Reading list",
+      modname: "lti",
+      url: `${BASE_URL}/mod/lti/view.php?id=24`,
+      visible: true,
+      description: "",
+      type: "lti",
+    });
+  });
+
   it("scrapes course contents when the course contents AJAX function is unavailable", async () => {
     installFetch([
       dashboardRoute,
       ajaxErrorRoute("core_course_get_contents"),
+      ajaxErrorRoute("core_courseformat_get_state"),
       (request) => (request.url === `${BASE_URL}/course/view.php?id=101` ? htmlResponse(fixture("course-page.html")) : undefined),
       (request) => (request.url === `${BASE_URL}/course/view.php?id=101&section=1` ? htmlResponse(fixture("course-section-1.html")) : undefined),
     ]);
@@ -197,6 +665,23 @@ describe("MoodleClient course/activity modules", () => {
         ],
       },
     ]);
+  });
+
+  it("follows HTML-encoded section links when AJAX fallbacks are unavailable", async () => {
+    const rootPage = fixture("course-page.html").replace("&section=1", "&amp;section=1");
+    installFetch([
+      dashboardRoute,
+      ajaxErrorRoute("core_course_get_contents"),
+      ajaxErrorRoute("core_courseformat_get_state"),
+      (request) => (request.url === `${BASE_URL}/course/view.php?id=101` ? htmlResponse(rootPage) : undefined),
+      (request) => (request.url === `${BASE_URL}/course/view.php?id=101&section=1` ? htmlResponse(fixture("course-section-1.html")) : undefined),
+    ]);
+    const client = new MoodleClient(BASE_URL, "session");
+
+    const sections = await client.getCourseContents(101);
+
+    expect(sections.flatMap((section) => section.activities).map((activity) => activity.name))
+      .toEqual(["Syllabus", "Quiz 1"]);
   });
 
   it("uses one batched AJAX POST for overview and preserves per-entry errors", async () => {
@@ -260,10 +745,11 @@ describe("MoodleClient course/activity modules", () => {
       { methodname: "ok_method", args: {} },
       { methodname: "bad_method", args: {} },
     ]);
-    expect(results[0].ok).toBe(true);
-    expect(results[1].ok).toBe(false);
-    if (!results[1].ok) {
-      expect(results[1].error).toBeInstanceOf(MoodleAPIError);
+    expect(results[0]?.ok).toBe(true);
+    const failed = results[1];
+    expect(failed?.ok).toBe(false);
+    if (failed && !failed.ok) {
+      expect(failed.error).toBeInstanceOf(MoodleAPIError);
     }
   });
 
@@ -294,6 +780,7 @@ describe("MoodleClient course/activity modules", () => {
   it("scrapes six activity detail pages and parses activity references", async () => {
     installFetch([
       dashboardRoute,
+      ajaxRoute("core_course_get_course_module", { cm: { id: 31, modname: "assign" } }),
       (request) => (request.url === `${BASE_URL}/mod/assign/view.php?id=31` ? htmlResponse(fixture("assign.html")) : undefined),
       (request) => (request.url === `${BASE_URL}/mod/quiz/view.php?id=32` ? htmlResponse(fixture("quiz.html")) : undefined),
       (request) => (request.url === `${BASE_URL}/mod/resource/view.php?id=33` ? htmlResponse(fixture("resource.html")) : undefined),
@@ -303,15 +790,61 @@ describe("MoodleClient course/activity modules", () => {
     ]);
     const client = new MoodleClient(BASE_URL, "session");
 
-    await expect(client.getAssignment(31)).resolves.toMatchObject({ name: "Essay 1", due_pretty: "Friday, 10 May 2026, 5:00 PM" });
-    await expect(client.getQuiz(32)).resolves.toMatchObject({ name: "Quiz 1", attempts_allowed: "2" });
-    await expect(client.getResource(33)).resolves.toMatchObject({ target_name: "slides.pdf" });
-    await expect(client.getLink(34)).resolves.toMatchObject({ target_url: "https://example.com/reading" });
+    await expect(client.getAssignment(31)).resolves.toMatchObject({ name: "Essay 1", due_pretty: "Friday, 10 May 2026, 5:00 PM", criteria: [], file_entries: [] });
+    await expect(client.getQuiz(32)).resolves.toMatchObject({ name: "Quiz 1", attempts_allowed: "2", time_limit: "55 mins", attempts: [{ id: 777, number: 1, status: "Finished", marks: "8.00/10.00" }] });
+    await expect(client.getResource(33)).resolves.toMatchObject({
+      target_name: "slides.pdf",
+      file_entries: [{
+        name: "slides.pdf",
+        url: `${BASE_URL}/pluginfile.php/1/slides.pdf`,
+        requires_authentication: true,
+      }],
+    });
+    await expect(client.getLink(34)).resolves.toMatchObject({
+      course_id: 101,
+      course_name: "Mathematics 101",
+      section_name: "Week 1",
+      target_url: "https://example.com/reading",
+    });
     await expect(client.getPage(35)).resolves.toMatchObject({ content_text: "Remember the integration rules." });
-    await expect(client.getFolder(36)).resolves.toMatchObject({ files: ["chapter-1.pdf", "chapter-2.pdf"] });
+    await expect(client.getFolder(36)).resolves.toMatchObject({
+      files: ["chapter-1.pdf", "chapter-2.pdf"],
+      file_entries: [
+        {
+          name: "chapter-1.pdf",
+          url: `${BASE_URL}/pluginfile.php/a.pdf`,
+          requires_authentication: true,
+        },
+        {
+          name: "chapter-2.pdf",
+          url: `${BASE_URL}/pluginfile.php/b.pdf`,
+          requires_authentication: true,
+        },
+      ],
+    });
+    await expect(client.getActivity(31)).resolves.toMatchObject({ id: 31, name: "Essay 1", type: "assign" });
 
     expect(parseActivityReference(`${BASE_URL}/mod/assign/view.php?id=31`, { label: "Assignment", path: "/mod/assign/view.php" })).toBe(31);
     expect(parseActivityReference("32", { label: "Quiz", path: "/mod/quiz/view.php" })).toBe(32);
+  });
+
+  it.each(["page", "resource"])("surfaces Moodle's %s error message in structured CLI output", async (moduleType) => {
+    const url = `${BASE_URL}/mod/${moduleType}/view.php?id=1477656`;
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      (request) => (request.url === url ? htmlResponse(fixture("moodle-error.html"), 404) : undefined),
+    ]);
+
+    const result = await runJsonCommand([url, "--json"], fetchImpl);
+
+    expect(result).toMatchObject({ code: 4, stdout: "" });
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: {
+        code: "not_found",
+        message: `Invalid unit module ID (HTTP 404 loading ${url})`,
+      },
+      exit_code: 4,
+    });
   });
 
   it("resolves top-level Moodle URLs and rejects unsupported paths", () => {
@@ -333,88 +866,34 @@ describe("MoodleClient course/activity modules", () => {
       dashboardRoute,
       ajaxRoute("core_enrol_get_users_courses", jsonFixture("courses.json")),
       ajaxRoute("core_course_get_contents", jsonFixture("course-contents.json")),
+      ajaxRoute("core_webservice_get_site_info", { userid: 7, fullname: "Alice", siteurl: BASE_URL }),
     ]);
 
-    const courses = await runJsonCommand(["courses", "--json", "--fields", "id,shortname"], fetchImpl);
+    const courses = await runJsonCommand(["courses", "--json", "--fields", "units,total"], fetchImpl);
     expect(courses.code).toBe(0);
-    expect(JSON.parse(courses.stdout)).toEqual([
-      { id: 101, shortname: "MATH101" },
-      { id: 202, shortname: "MATH102" },
-    ]);
+    expect(JSON.parse(courses.stdout)).toMatchObject({ units: [{ id: 101, code: "MATH101" }, { id: 202, code: "MATH102" }], total: 2 });
 
-    const course = await runJsonCommand(["course", "101", "--json"], fetchImpl);
+    const course = await runJsonCommand(["units", "show", "101", "--json"], fetchImpl);
     expect(course.code).toBe(0);
     const courseJson = JSON.parse(course.stdout);
-    expect(courseJson[0].id).toBe(11);
-    expect(courseJson[0].name).toBe("Introduction");
-    expect(courseJson[0].activities[0]).toMatchObject({ id: 21, name: "Syllabus" });
+    expect(courseJson.sections[0].id).toBe(11);
+    expect(courseJson.sections[0].name).toBe("Introduction");
+    expect(courseJson.sections[0]).toMatchObject({ activity_count: 2 });
+    expect(courseJson.sections[0]).not.toHaveProperty("activities");
 
     const activities = await runJsonCommand(["activities", "101", "--json"], fetchImpl);
     expect(activities.code).toBe(0);
-    expect(JSON.parse(activities.stdout)).toEqual([
-      { id: 21, name: "Syllabus", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=21`, visible: true, description: "Read first" },
-      { id: 22, name: "Quiz 1", modname: "quiz", url: `${BASE_URL}/mod/quiz/view.php?id=22`, visible: false },
-    ]);
-  });
-
-  it("downloads one course week from a short code and week number", async () => {
-    const fetchImpl = cliFetch([
-      dashboardRoute,
-      ajaxRoute("core_enrol_get_users_courses", [{
-        id: 1061,
-        shortname: "FIT1061",
-        fullname: "Introduction to Programming",
-        category: 4,
-        visible: true,
-        startdate: 1700000000,
-      }]),
-      ajaxRoute("core_course_get_contents", [
-        {
-          id: 11,
-          name: "Week 1",
-          section: 1,
-          visible: true,
-          summary: "",
-          modules: [
-            { id: 55, name: "Week 1 slides", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=55`, visible: true, description: "" },
-          ],
-        },
-        {
-          id: 12,
-          name: "Week 2",
-          section: 2,
-          visible: true,
-          summary: "",
-          modules: [
-            { id: 77, name: "Week 2 slides", modname: "resource", url: `${BASE_URL}/mod/resource/view.php?id=77`, visible: true, description: "" },
-          ],
-        },
-      ]),
-      (request) => request.url === `${BASE_URL}/mod/resource/view.php?id=55` ? htmlResponse(fixture("resource.html")) : undefined,
-    ]);
-
-    const result = await runJsonCommand(["download", "FIT1061", "1", "--dir", "./w1", "--dry-run", "--json"], fetchImpl);
-
-    expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual([{
-      name: "slides.pdf",
-      url: `${BASE_URL}/pluginfile.php/1/slides.pdf`,
-      bytes: 0,
-      status: "planned",
-    }]);
-
-    const missing = await runJsonCommand(["download", "FIT1061", "3", "--dry-run", "--json"], fetchImpl);
-    expect(missing.code).toBe(4);
-    expect(JSON.parse(missing.stderr).message).toBe("Week 3 was not found in course 1061.");
-
-    const conflicting = await runJsonCommand(["download", "FIT1061", "--course", "FIT1061", "--dry-run", "--json"], fetchImpl);
-    expect(conflicting.code).toBe(3);
-    expect(JSON.parse(conflicting.stderr).message).toMatch(/together with --course/);
+    expect(JSON.parse(activities.stdout)).toEqual({ activities: [
+      { id: 21, name: "Syllabus", type: "resource", section_id: 11, description: "Read first" },
+      { id: 22, name: "Quiz 1", type: "quiz", section_id: 11, hidden: true },
+    ], total: 2 });
   });
 
   it("prints CLI JSON parity for todo, alerts, and overview", async () => {
     const fetchImpl = cliFetch([
       dashboardRoute,
+      ajaxRoute("core_enrol_get_users_courses", jsonFixture("courses.json")),
+      ajaxRoute("core_webservice_get_site_info", { userid: 7, fullname: "Alice", siteurl: BASE_URL }),
       (request) => {
         if (request.init?.method !== "POST") {
           return undefined;
@@ -434,21 +913,21 @@ describe("MoodleClient course/activity modules", () => {
       },
     ]);
 
-    const todo = await runJsonCommand(["todo", "--limit", "5", "--json", "--fields", "id,name"], fetchImpl);
+    const todo = await runJsonCommand(["todo", "--limit", "5", "--json", "--fields", "due,total"], fetchImpl);
     expect(todo.code).toBe(0);
-    expect(JSON.parse(todo.stdout)).toEqual([{ id: 301, name: "Quiz 1 is due" }]);
+    expect(JSON.parse(todo.stdout)).toMatchObject({ due: [{ id: 301, name: "Quiz 1" }], total: 1 });
 
     const alerts = await runJsonCommand(["alerts", "--json"], fetchImpl);
     expect(alerts.code).toBe(0);
-    expect(JSON.parse(alerts.stdout)).toMatchObject({ notification_count: 1, direct_message_count: 2, unread_direct_message_count: 1 });
+    expect(JSON.parse(alerts.stdout)).toMatchObject({ alerts: { notification_count: 1, direct_message_count: 2, unread_direct_message_count: 1 } });
 
     const overview = await runJsonCommand(["overview", "--json"], fetchImpl);
     expect(overview.code).toBe(0);
     const overviewJson = JSON.parse(overview.stdout);
-    expect(overviewJson.user.userid).toBe(7);
-    expect(overviewJson.courses[0].id).toBe(101);
-    expect(overviewJson.todo[0].id).toBe(301);
-    expect(overviewJson.alerts.notification_count).toBe(1);
+    expect(overviewJson.home.name).toBeTruthy();
+    expect(overviewJson.home.units[0].id).toBe(101);
+    expect(overviewJson.home.due[0].id).toBe(301);
+    expect(overviewJson.home.unread.notification_count).toBe(1);
   });
 
   it("routes top-level URLs with structured output options", async () => {
@@ -457,10 +936,23 @@ describe("MoodleClient course/activity modules", () => {
       (request) => (request.url === `${BASE_URL}/mod/assign/view.php?id=31` ? htmlResponse(fixture("assign.html")) : undefined),
     ]);
 
-    const result = await runJsonCommand([`${BASE_URL}/mod/assign/view.php?id=31`, "--json", "--fields", "id,name"], fetchImpl);
+    const result = await runJsonCommand([`${BASE_URL}/mod/assign/view.php?id=31`, "--json", "--fields", "item"], fetchImpl);
 
     expect(result).toMatchObject({ code: 0, stderr: "" });
-    expect(JSON.parse(result.stdout)).toEqual({ id: 31, name: "Essay 1" });
+    expect(JSON.parse(result.stdout)).toMatchObject({ item: { id: 31, name: "Essay 1" } });
+  });
+
+  it("resolves the activity type for activities show", async () => {
+    const fetchImpl = cliFetch([
+      dashboardRoute,
+      ajaxRoute("core_course_get_course_module", { cm: { id: 31, modname: "assign" } }),
+      (request) => (request.url === `${BASE_URL}/mod/assign/view.php?id=31` ? htmlResponse(fixture("assign.html")) : undefined),
+    ]);
+
+    const result = await runJsonCommand(["activities", "show", "31", "--json"], fetchImpl);
+
+    expect(result).toMatchObject({ code: 0, stderr: "" });
+    expect(JSON.parse(result.stdout)).toMatchObject({ item: { id: 31, name: "Essay 1", type: "assign" } });
   });
 
   it("returns usage errors for invalid URL --fields", async () => {
@@ -470,16 +962,16 @@ describe("MoodleClient course/activity modules", () => {
     ]);
 
     const invalid = await runJsonCommand([`${BASE_URL}/mod/assign/view.php?id=31`, "--json", "--fields", "missing"], fetchImpl);
-    expect(invalid.code).toBe(3);
-    expect(JSON.parse(invalid.stderr)).toMatchObject({ code: "usage_error" });
+    expect(invalid.code).toBe(2);
+    expect(JSON.parse(invalid.stderr)).toMatchObject({ error: { code: "usage" }, exit_code: 2 });
     expect(invalid.stderr).toContain("Valid fields");
 
     const missing = await runJsonCommand([`${BASE_URL}/mod/assign/view.php?id=31`, "--json", "--fields"], fetchImpl);
-    expect(missing.code).toBe(3);
-    expect(JSON.parse(missing.stderr)).toMatchObject({ code: "usage_error", message: "--fields requires a value." });
+    expect(missing.code).toBe(2);
+    expect(JSON.parse(missing.stderr)).toMatchObject({ error: { code: "usage", message: expect.stringContaining("fields") }, exit_code: 2 });
   });
 
-  it("applies --fields to forum find", async () => {
+  it("applies --fields to forum search", async () => {
     const fetchImpl = cliFetch([
       dashboardRoute,
       ajaxRoute("core_enrol_get_users_courses", jsonFixture("courses.json")),
@@ -518,19 +1010,21 @@ describe("MoodleClient course/activity modules", () => {
     ]);
 
     const result = await runJsonCommand([
-      "forum",
-      "find",
+      "forums",
+      "search",
       "deadline",
       "--forum",
       "501",
       "--titles-only",
+      "--limit",
+      "1",
       "--json",
       "--fields",
-      "discussion_id,discussion_subject",
+      "results",
     ], fetchImpl);
 
     expect(result).toMatchObject({ code: 0, stderr: "" });
-    expect(JSON.parse(result.stdout)).toEqual({ discussion_id: 9001, discussion_subject: "Exam deadline questions" });
+    expect(JSON.parse(result.stdout)).toMatchObject({ results: [{ discussion_id: 9001, name: "Exam deadline questions" }] });
   });
 });
 

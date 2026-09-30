@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
 
     steps:
       - name: Checkout
@@ -39,6 +39,22 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Test real Worker runtime
+        if: matrix.node-version == 22
+        run: npm run test:worker:runtime
+
+      - name: Install browser for OAuth regression
+        if: matrix.node-version == 22
+        run: npx playwright install --with-deps chromium
+
+      - name: Test browser OAuth consent
+        if: matrix.node-version == 22
+        run: npm run test:worker:browser
+
+      - name: Audit dependencies
+        if: matrix.node-version == 22
+        run: npm audit --audit-level=low
 
       - name: Check npm package contents
         run: npm run pack:check
@@ -76,6 +92,9 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Smoke test standalone binary
+        run: bun run bin:smoke
+
       - name: Check npm package contents
         run: bun run pack:check
 
@@ -86,3 +105,23 @@ jobs:
         run: |
           bun run skill:generate
           git diff --exit-code -- SKILL.md references agents/openai.yaml
+
+  windows-credentials:
+    name: Windows protected credentials
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test Windows credential stores
+        run: npx vitest run tests/deployment-credentials.test.ts

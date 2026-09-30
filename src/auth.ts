@@ -1,17 +1,19 @@
-import { execFile as execFileCallback } from "node:child_process";
-import { copyFile, mkdtemp, readdir, rm, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { fetchWithSession } from "./session-fetch.js";
+import { ALL_PROFILES, getCookies } from "@steipete/sweet-cookie";
+import { readdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   DASHBOARD_PATH,
+  ENV_MOODLE_TOKEN,
   ENV_MOODLE_SESSION,
   LOGIN_PATH,
   MOODLE_SESSION_COOKIE_PREFIX,
-  OKTA_AUTH_CONFIG_COMMAND,
-  OKTA_AUTH_INSTALL_COMMAND,
-  OKTA_AUTH_URL,
 } from "./constants.js";
-import { AuthError } from "./errors.js";
+import { browserCookieStores, cookieStoresBlocked, unreadableCookieStores, type CookieStore } from "./cookie-stores.js";
+import { CdpError, cdpProfileDir, findChromiumBrowser, loginWithCdp, type CdpCookie, type CdpLoginOptions, type CdpLoginResult } from "./cdp-login.js";
+import { fetchMobileToken, mintSessionFromMobileToken, readMobilePublicConfig, type MobileToken } from "./mobile-login-core.js";
+import { AuthError, asNetworkError } from "./errors.js";
 import {
   deleteCachedSession,
   readCachedSession,
@@ -38,13 +40,6 @@ export interface AuthenticatedSession extends SessionValidation {
   fromCache: boolean;
 }
 
-export interface CommandResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-}
-
-export type ExecFile = (file: string, args: string[]) => Promise<CommandResult>;
 export type CookieProvider = (baseUrl: string, options: AuthOptions) => Promise<MoodleSessionCookie[]>;
 export type SessionValidator = (baseUrl: string, cookie: MoodleSessionCookie) => Promise<SessionValidation | null>;
 
@@ -53,22 +48,56 @@ export interface AuthOptions {
   fetch?: typeof fetch;
   validateSession?: SessionValidator;
   browserCookieProvider?: CookieProvider;
-  oktaCookieProvider?: CookieProvider;
-  execFile?: ExecFile;
   homeDir?: string;
   platform?: NodeJS.Platform;
   noCache?: boolean;
   cacheTtlMs?: number;
   now?: () => number;
   nonInteractive?: boolean;
+  onCookieWarnings?: (warnings: string[]) => void;
+  // Trade a genuinely new session for a durable mobile token, when the site
+  // offers one. Opt-in so ordinary cold reads never make the extra call; the
+  // login commands set it.
+  captureMobileToken?: boolean;
 }
 
-interface ChromeCookiesSecure {
-  getCookiesPromised(
-    url: string,
-    format: "puppeteer",
-    profileOrPath?: string,
-  ): Promise<Array<{ name: string; value: string; domain?: string; path?: string }>>;
+export interface BrowserLoginOptions extends AuthOptions {
+  onBrowserOpened?: (url: string) => void;
+  // Drive sign-in through a CLI-owned Chromium over CDP instead of the cookie
+  // store. Injected in tests; defaults to the real browser launcher.
+  cdpLogin?: (options: CdpLoginOptions) => Promise<CdpLoginResult>;
+  // Probe for an installed Chromium; injected in tests to simulate its absence.
+  findBrowser?: (options: CdpLoginOptions) => Promise<{ path: string; name: string } | null>;
+  // Render no browser window; only usable when the CLI profile already holds a
+  // live identity-provider session. Used by unattended renewal.
+  headlessCdp?: boolean;
+  // How long the OS cookie-store read may take before we abandon it and drive a
+  // browser sign-in instead. A macOS Keychain prompt or a locked store can stall
+  // the read indefinitely, and that must never block the login the user asked
+  // for. Injected small in tests.
+  cookieStoreTimeoutMs?: number;
+}
+
+// Enough for a user to approve a Keychain prompt, short enough that a wedged
+// store read hands off to the browser without an awkward wait.
+const COOKIE_STORE_TIMEOUT_MS = 8_000;
+
+/** Resolve with the promise, or with `onTimeout()` after `ms`, whichever is first. */
+function withTimeoutValue<T>(promise: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(onTimeout()), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
 }
 
 export async function getAuthenticatedSession(
@@ -82,7 +111,7 @@ export async function getAuthenticatedSession(
     const context = await validate(baseUrl, envSession);
     if (!context) {
       throw new AuthError(
-        `${ENV_MOODLE_SESSION} is set but did not authenticate for ${baseUrl}.`,
+        `${envSession.source === ENV_MOODLE_TOKEN ? ENV_MOODLE_TOKEN : ENV_MOODLE_SESSION} is set but did not authenticate for ${baseUrl}.`,
         authFailureHint(baseUrl),
       );
     }
@@ -95,40 +124,213 @@ export async function getAuthenticatedSession(
     return cached;
   }
 
+  // A durable mobile token renews the cookie with no browser and no disk access,
+  // so wherever the instance supports the mobile service it is the best source.
+  // Prefer it before reading the OS cookie store. readCachedSession honours
+  // noCache, so an explicit fresh login never silently reuses the token.
+  const minted = await mintFromStoredToken(baseUrl, options, validate);
+  if (minted) {
+    return minted;
+  }
+
+  const cookieWarnings: string[] = [];
+  const providerOptions: AuthOptions = {
+    ...options,
+    onCookieWarnings: (warnings) => {
+      cookieWarnings.push(...warnings);
+      options.onCookieWarnings?.(warnings);
+    },
+  };
   const browserProvider = options.browserCookieProvider ?? defaultBrowserCookieProvider;
-  const browserCookies = matchingMoodleSessionCookies(await browserProvider(baseUrl, options), baseUrl);
+  const browserCookies = matchingMoodleSessionCookies(await browserProvider(baseUrl, providerOptions), baseUrl);
   const browserSession = await firstValidSession(baseUrl, browserCookies, validate);
   if (browserSession) {
     await refreshSessionCache(baseUrl, browserSession.cookie, browserSession.context, options);
     return { baseUrl, cookie: browserSession.cookie, ...browserSession.context, fromCache: false };
   }
 
-  const oktaProvider = options.oktaCookieProvider ?? loadSessionsFromOktaCli;
-  const oktaCookies = matchingMoodleSessionCookies(await oktaProvider(baseUrl, options), baseUrl);
-  const oktaSession = await firstValidSession(baseUrl, oktaCookies, validate);
-  if (oktaSession) {
-    await refreshSessionCache(baseUrl, oktaSession.cookie, oktaSession.context, options);
-    return { baseUrl, cookie: oktaSession.cookie, ...oktaSession.context, fromCache: false };
-  }
+  // Every command lands here, so it must name the same cause as auth login does.
+  const stores = await browserCookieStores({ homeDir: options.homeDir, platform: options.platform });
+  throw new AuthError(
+    `No usable MoodleSession found for ${baseUrl}.`,
+    authFailureHint(baseUrl, cookieWarnings, options.platform, unreadableCookieStores(stores), options.env),
+  );
+}
 
-  if (!options.oktaCookieProvider && oktaCookies.length && !options.nonInteractive) {
-    const refreshed = matchingMoodleSessionCookies(
-      await loadSessionsFromOktaCli(baseUrl, { ...options, oktaCookieProvider: undefined, noCache: true }, true),
-      baseUrl,
-    );
-    const refreshedSession = await firstValidSession(baseUrl, refreshed, validate);
-    if (refreshedSession) {
-      await refreshSessionCache(baseUrl, refreshedSession.cookie, refreshedSession.context, options);
-      return { baseUrl, cookie: refreshedSession.cookie, ...refreshedSession.context, fromCache: false };
+export async function getAuthenticatedSessionWithBrowserFallback(
+  baseUrl: string,
+  options: BrowserLoginOptions = {},
+): Promise<AuthenticatedSession> {
+  const cookieWarnings: string[] = [];
+  // Time-bound the cookie-store read so a stalled Keychain prompt or a locked
+  // store cannot keep the CLI from reaching the browser sign-in below. A read
+  // that succeeds quickly still wins, so the zero-interaction path is preserved.
+  const rawProvider = options.browserCookieProvider ?? defaultBrowserCookieProvider;
+  const cookieStoreTimeoutMs = options.cookieStoreTimeoutMs ?? COOKIE_STORE_TIMEOUT_MS;
+  const boundedProvider: CookieProvider = (url, opts) =>
+    withTimeoutValue(rawProvider(url, opts), cookieStoreTimeoutMs, () => {
+      opts.onCookieWarnings?.(["Reading the browser cookie store timed out; opening a browser to sign in."]);
+      return [];
+    });
+  const authOptions: AuthOptions = {
+    ...options,
+    noCache: true,
+    nonInteractive: true,
+    browserCookieProvider: boundedProvider,
+    onCookieWarnings: (warnings) => {
+      cookieWarnings.push(...warnings);
+      options.onCookieWarnings?.(warnings);
+    },
+  };
+  const browserAuthOptions: AuthOptions = {
+    ...authOptions,
+    env: { ...(options.env ?? process.env), [ENV_MOODLE_SESSION]: undefined },
+  };
+  try {
+    return await getAuthenticatedSession(baseUrl, authOptions);
+  } catch (error) {
+    if (!(error instanceof AuthError)) {
+      throw error;
     }
   }
 
-  throw new AuthError(`No usable MoodleSession found for ${baseUrl}.`, authFailureHint(baseUrl));
+  if (loadSessionFromEnv(options.env)) {
+    try {
+      return await getAuthenticatedSession(baseUrl, browserAuthOptions);
+    } catch (error) {
+      if (!(error instanceof AuthError)) {
+        throw error;
+      }
+    }
+  }
+
+  // The old fallback opened the system browser and polled the cookie store,
+  // which is exactly what fails inside a sandboxed terminal or a locked store.
+  // Instead, sign in through a Chromium the CLI drives over CDP and read the
+  // cookie straight from that live browser. When no browser exists to drive and
+  // the store is also unreadable, the store error is still the honest cause.
+  const probeBrowser = options.findBrowser ?? findChromiumBrowser;
+  const hasBrowser = Boolean(await probeBrowser({ ...(options as CdpLoginOptions) }));
+  if (!hasBrowser) {
+    const stores = await browserCookieStores({ homeDir: options.homeDir, platform: options.platform });
+    if (cookieAccessBlocked(cookieWarnings) || cookieStoresBlocked(stores)) {
+      throw new AuthError(
+        `Cannot read browser cookies for ${baseUrl}.`,
+        cookieAccessHint(cookieWarnings, options.platform, unreadableCookieStores(stores), options.env),
+      );
+    }
+  }
+  return loginViaCdp(baseUrl, { ...options, ...browserAuthOptions });
+}
+
+function toSessionCookie(cookie: CdpCookie): MoodleSessionCookie {
+  return { name: cookie.name, value: cookie.value, domain: cookie.domain, path: cookie.path, source: "cdp" };
+}
+
+/**
+ * Sign in through a CLI-owned Chromium and read the resulting session over CDP.
+ * A fresh MoodleSession appears before login on many sites (an anonymous
+ * session), so presence alone is not enough: we validate a candidate only when
+ * its value changes, which keeps the login to one dashboard check per real
+ * cookie rather than one per poll.
+ */
+async function loginViaCdp(baseUrl: string, options: BrowserLoginOptions): Promise<AuthenticatedSession> {
+  const validate = options.validateSession ?? validateSessionWithFetch(options);
+  const runCdp = options.cdpLogin ?? loginWithCdp;
+  const url = loginUrl(baseUrl);
+  let resolved: { cookie: MoodleSessionCookie; context: SessionValidation } | null = null;
+  let lastChecked = "";
+
+  try {
+    await runCdp({
+      url,
+      headless: options.headlessCdp ?? false,
+      homeDir: options.homeDir,
+      platform: options.platform,
+      env: options.env,
+      onOpened: () => options.onBrowserOpened?.(url),
+      isDone: async (cookies) => {
+        if (resolved) return true;
+        const top = matchingMoodleSessionCookies(cookies.map(toSessionCookie), baseUrl)[0];
+        if (!top || top.value === lastChecked) return false;
+        lastChecked = top.value;
+        const context = await validate(baseUrl, top);
+        if (context) {
+          resolved = { cookie: top, context };
+          return true;
+        }
+        return false;
+      },
+    });
+  } catch (error) {
+    if (error instanceof CdpError) {
+      throw new AuthError(error.message, error.hint ?? authFailureHint(baseUrl, [], options.platform, [], options.env));
+    }
+    throw error;
+  }
+
+  const session = resolved as { cookie: MoodleSessionCookie; context: SessionValidation } | null;
+  if (!session) {
+    throw new AuthError(`Sign-in did not complete for ${baseUrl}.`, `Run: moodle auth login`);
+  }
+  await refreshSessionCache(baseUrl, session.cookie, session.context, { ...options, noCache: false });
+  return { baseUrl, cookie: session.cookie, ...session.context, fromCache: false };
+}
+
+/**
+ * Pulls the cookie out of whatever the browser was willing to copy: a devtools
+ * "Copy as cURL" command, a Cookie header, a name=value pair, or the bare value.
+ * Deciding which of those to produce is the step users get wrong, and a wrong
+ * paste costs one failed request, so parsing loosely is cheaper than explaining.
+ */
+export function parsePastedSessionCookie(raw: string): MoodleSessionCookie | null {
+  const text = raw.trim();
+  if (!text) {
+    return null;
+  }
+  const pair = /\b(MoodleSession\w*)=([^;\s'"\\]+)/.exec(text);
+  if (pair) {
+    return { name: pair[1], value: pair[2], source: "paste" };
+  }
+  // A lone token is the value itself; anything else is a mis-paste we should
+  // reject rather than send to Moodle as a cookie.
+  return /[\s=;]/.test(text) ? null : { name: MOODLE_SESSION_COOKIE_PREFIX, value: text, source: "paste" };
+}
+
+/**
+ * The escape hatch for machines where the cookie store cannot be read at all.
+ * The cookie is cached like any other, so this is a one-time paste.
+ */
+export async function authenticateWithPastedCookie(
+  baseUrl: string,
+  raw: string,
+  options: AuthOptions = {},
+): Promise<AuthenticatedSession> {
+  const cookie = parsePastedSessionCookie(raw);
+  if (!cookie) {
+    throw new AuthError(`That is not a ${MOODLE_SESSION_COOKIE_PREFIX} cookie value.`, pastedCookieHint(baseUrl));
+  }
+  const validate = options.validateSession ?? validateSessionWithFetch(options);
+  const context = await validate(baseUrl, cookie);
+  if (!context) {
+    throw new AuthError(`The pasted cookie did not authenticate for ${baseUrl}.`, pastedCookieHint(baseUrl));
+  }
+  await refreshSessionCache(baseUrl, cookie, context, { ...options, noCache: false });
+  return { baseUrl, cookie, ...context, fromCache: false };
+}
+
+export function pastedCookieHint(baseUrl: string): string {
+  return [
+    `Sign in at ${loginUrl(baseUrl)}, then open the browser developer tools.`,
+    'In the Network tab, right-click any request to the site and choose "Copy as cURL", then paste the whole command.',
+    `Copying the ${MOODLE_SESSION_COOKIE_PREFIX} value from Application (or Storage) > Cookies works too.`,
+  ].join("\n");
 }
 
 export function loadSessionFromEnv(env: Record<string, string | undefined> = process.env): MoodleSessionCookie | null {
-  const value = env[ENV_MOODLE_SESSION]?.trim();
-  return value ? { name: MOODLE_SESSION_COOKIE_PREFIX, value, source: "env" } : null;
+  const source = env[ENV_MOODLE_TOKEN] ? ENV_MOODLE_TOKEN : ENV_MOODLE_SESSION;
+  const value = env[source]?.trim();
+  return value ? { name: MOODLE_SESSION_COOKIE_PREFIX, value, source } : null;
 }
 
 export function matchingMoodleSessionCookies(cookies: MoodleSessionCookie[], baseUrl: string): MoodleSessionCookie[] {
@@ -161,41 +363,170 @@ export async function defaultBrowserCookieProvider(
   baseUrl: string,
   options: AuthOptions = {},
 ): Promise<MoodleSessionCookie[]> {
-  const chromiumCookies = await loadChromiumCookies(baseUrl, options);
-  const firefoxCookies = await loadFirefoxCookies(options);
-  return [...chromiumCookies, ...firefoxCookies];
+  const primary = await getCookies({
+    url: baseUrl,
+    browsers: ["chrome", "edge", "firefox", "safari"],
+    chromeProfile: ALL_PROFILES,
+    edgeProfile: ALL_PROFILES,
+    firefoxProfile: ALL_PROFILES,
+    mode: "merge",
+  });
+  const braveProfiles = await braveProfilePaths(options);
+  const brave = braveProfiles.length
+    ? await getCookies({ url: baseUrl, browsers: ["chrome"], chromeProfile: braveProfiles, mode: "merge" })
+    : { cookies: [], warnings: [] as string[] };
+
+  // sweet-cookie reports unreadable stores here and documents that warnings never
+  // contain cookie values, so they are safe to relay to the user verbatim.
+  const warnings = [...(primary.warnings ?? []), ...(brave.warnings ?? [])];
+  if (warnings.length) {
+    options.onCookieWarnings?.(warnings);
+  }
+
+  return [...primary.cookies, ...brave.cookies].map((cookie) => ({
+    name: cookie.name,
+    value: cookie.value,
+    domain: cookie.domain,
+    path: cookie.path,
+    source: [cookie.source?.browser, cookie.source?.profile].filter(Boolean).join(":") || "browser",
+  }));
 }
 
-export async function loadSessionsFromOktaCli(
+export async function braveProfilePaths(options: AuthOptions = {}): Promise<string[]> {
+  const home = options.homeDir ?? homedir();
+  const platform = options.platform ?? process.platform;
+  const roots = platform === "linux"
+    ? [
+        join(home, ".config/BraveSoftware/Brave-Browser"),
+        join(home, ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"),
+      ]
+    : platform === "win32"
+      ? [join(home, "AppData/Local/BraveSoftware/Brave-Browser/User Data")]
+      : platform === "darwin"
+        ? [join(home, "Library/Application Support/BraveSoftware/Brave-Browser")]
+        : [];
+
+  const profiles: string[] = [];
+  for (const root of roots) {
+    try {
+      profiles.push(
+        ...(await readdir(root, { withFileTypes: true }))
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => entry.name)
+          .filter((name) => name === "Default" || name === "Guest Profile" || name.startsWith("Profile "))
+          .sort()
+          .map((name) => join(root, name)),
+      );
+    } catch {
+      continue;
+    }
+  }
+  return profiles;
+}
+
+const FULL_DISK_ACCESS_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+
+/**
+ * macOS grants Full Disk Access to the application that owns the process tree,
+ * which is the terminal, never the CLI. Naming it saves the user from guessing.
+ */
+const TERMINAL_APPLICATIONS: Readonly<Record<string, string>> = {
+  Apple_Terminal: "Terminal",
+  ghostty: "Ghostty",
+  Hyper: "Hyper",
+  "iTerm.app": "iTerm",
+  Tabby: "Tabby",
+  vscode: "Visual Studio Code",
+  WarpTerminal: "Warp",
+  WezTerm: "WezTerm",
+};
+
+export function hostApplicationName(env: Record<string, string | undefined> = process.env): string | null {
+  const program = env.TERM_PROGRAM?.trim();
+  return program ? TERMINAL_APPLICATIONS[program] ?? program : null;
+}
+
+const COOKIE_ACCESS_DENIED = /EPERM|EACCES|operation not permitted|permission denied/i;
+// Chromium cookie stores are read through node:sqlite, which Node only ships
+// unflagged from 22.13. Older runtimes cannot read any browser cookie.
+const COOKIE_SQLITE_UNAVAILABLE = /No such built-in module: node:sqlite/i;
+export const MINIMUM_NODE_FOR_BROWSER_COOKIES = "22.13.0";
+
+/**
+ * True when the cookie store could not be read at all. Logging in again cannot
+ * fix this, so callers must not fall back to a browser login loop.
+ */
+export function cookieAccessBlocked(warnings: readonly string[]): boolean {
+  return warnings.some((warning) => COOKIE_ACCESS_DENIED.test(warning) || COOKIE_SQLITE_UNAVAILABLE.test(warning));
+}
+
+export function cookieAccessHint(
+  warnings: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  unreadable: readonly CookieStore[] = [],
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const grant = platform === "darwin"
+    ? [
+        `Grant Full Disk Access to ${hostApplicationName(env) ?? "the application running this command"}, then restart it:`,
+        `  open "${FULL_DISK_ACCESS_PANE}"`,
+      ].join("\n")
+    : "Run this command as the user that owns the browser profile, or grant it read access to the browser cookie store.";
+  const remedy: string[] = [];
+  if (warnings.some((warning) => COOKIE_SQLITE_UNAVAILABLE.test(warning))) {
+    remedy.push(
+      `This Node.js runtime has no node:sqlite, which is needed to read browser cookies. Use Node.js ${MINIMUM_NODE_FOR_BROWSER_COOKIES} or newer, or run the CLI with Bun (bunx --bun moodle-cli).`,
+    );
+  }
+  // An unreadable store is a permission problem even when the runtime is also
+  // too old, so both remedies belong in the message.
+  if (unreadable.length || !remedy.length) {
+    remedy.push(
+      "If this runs inside a sandboxed app (an IDE or agent terminal), rerun it from a regular terminal first.",
+      grant,
+    );
+  }
+  return [
+    "The browser cookie store could not be read, so the session could not be detected.",
+    ...remedy,
+    "Or skip the store entirely: `moodle auth login --paste` takes the cookie by hand and caches it.",
+    "Run moodle doctor for runtime and browser diagnostics.",
+    ...cookieDiagnostics(warnings, unreadable),
+  ].join("\n");
+}
+
+/**
+ * Only the stores that could have held a session are worth printing. "Edge
+ * cookies database not found" on a machine without Edge is noise, and every
+ * command used to print four such lines on every auth failure.
+ */
+function cookieDiagnostics(warnings: readonly string[], unreadable: readonly CookieStore[]): string[] {
+  const probed = unreadable.map((store) => store.path);
+  const lines = [
+    ...unreadable.map((store) => `  - ${store.browser} cookie store exists but cannot be opened: ${store.path}`),
+    ...warnings
+      .filter((warning) => COOKIE_ACCESS_DENIED.test(warning) || COOKIE_SQLITE_UNAVAILABLE.test(warning))
+      .filter((warning) => !probed.some((path) => warning.includes(path)))
+      .map((warning) => `  - ${warning}`),
+  ];
+  return lines.length ? ["", "Cookie store diagnostics:", ...lines] : [];
+}
+
+export function authFailureHint(
   baseUrl: string,
-  options: AuthOptions = {},
-  forceLogin = false,
-): Promise<MoodleSessionCookie[]> {
-  const execFile = options.execFile ?? defaultExecFile;
-  const executable = await findExecutable("okta", execFile, options.platform);
-  if (!executable) {
-    return [];
+  cookieWarnings: readonly string[] = [],
+  platform: NodeJS.Platform = process.platform,
+  unreadable: readonly CookieStore[] = [],
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (cookieAccessBlocked(cookieWarnings) || unreadable.length) {
+    return cookieAccessHint(cookieWarnings, platform, unreadable, env);
   }
-
-  const stored = await readOktaCookies(executable, baseUrl, execFile);
-  if ((stored.length && !forceLogin) || options.nonInteractive) {
-    return stored;
-  }
-
-  const login = await runOktaJson(executable, ["login", baseUrl], execFile);
-  if (!login) {
-    return stored;
-  }
-  const refreshed = await readOktaCookies(executable, baseUrl, execFile);
-  return refreshed.length ? refreshed : stored;
-}
-
-export function authFailureHint(baseUrl: string): string {
   return [
     `Log in to ${loginUrl(baseUrl)} in your browser, then rerun the command.`,
-    `Or set ${ENV_MOODLE_SESSION} to a valid MoodleSession cookie value.`,
-    `For automatic login, install okta-auth: ${OKTA_AUTH_INSTALL_COMMAND}, then run ${OKTA_AUTH_CONFIG_COMMAND}.`,
-    `okta-auth: ${OKTA_AUTH_URL}`,
+    "Or run `moodle auth login` to sign in through a browser window this command controls.",
+    "Or run `moodle auth login --paste` to hand over the cookie yourself.",
+    ...cookieDiagnostics(cookieWarnings, unreadable),
   ].join("\n");
 }
 
@@ -232,11 +563,14 @@ function validateSessionWithFetch(options: AuthOptions): SessionValidator {
 
     let response: Response;
     try {
-      response = await fetcher(`${baseUrl}${DASHBOARD_PATH}`, {
-        redirect: "follow",
-        headers: { cookie: `${cookie.name}=${cookie.value}` },
-      });
-    } catch {
+      response = await fetchWithSession(`${baseUrl}${DASHBOARD_PATH}`, {}, baseUrl, cookie, fetcher);
+    } catch (error) {
+      // An unreachable site is not an expired cookie. Reporting it as one sends
+      // the user off to log in again while the real fault is the connection.
+      const network = asNetworkError(error);
+      if (network) {
+        throw network;
+      }
       return null;
     }
 
@@ -250,224 +584,6 @@ function validateSessionWithFetch(options: AuthOptions): SessionValidator {
     }
     return parseSessionContext(html);
   };
-}
-
-async function loadChromiumCookies(baseUrl: string, options: AuthOptions): Promise<MoodleSessionCookie[]> {
-  const chrome = await importChromeCookiesSecure();
-  if (!chrome) {
-    return [];
-  }
-
-  const cookies: MoodleSessionCookie[] = [];
-  for (const browser of ["Chrome", "Brave", "Edge"] as const) {
-    for (const cookieFile of await chromiumCookieFiles(browser, options)) {
-      try {
-        const items = await chrome.getCookiesPromised(baseUrl, "puppeteer", cookieFile);
-        cookies.push(
-          ...items.map((cookie) => ({
-            name: cookie.name,
-            value: cookie.value,
-            domain: cookie.domain,
-            path: cookie.path,
-            source: `${browser}:${basename(cookieFile)}`,
-          })),
-        );
-      } catch {
-        continue;
-      }
-    }
-  }
-  return cookies;
-}
-
-async function loadFirefoxCookies(options: AuthOptions): Promise<MoodleSessionCookie[]> {
-  const execFile = options.execFile ?? defaultExecFile;
-  const sqlite = await findExecutable("sqlite3", execFile, options.platform);
-  if (!sqlite) {
-    return [];
-  }
-
-  const cookies: MoodleSessionCookie[] = [];
-  for (const cookieFile of await firefoxCookieFiles(options)) {
-    const tempDir = await mkdtemp(join(tmpdir(), "moodle-cli-firefox-"));
-    const tempDb = join(tempDir, "cookies.sqlite");
-    try {
-      await copyFile(cookieFile, tempDb);
-      const result = await execFile(sqlite, [
-        "-json",
-        tempDb,
-        "select name, value, host as domain, path from moz_cookies where name like 'MoodleSession%';",
-      ]);
-      if (result.exitCode !== 0 || !result.stdout.trim()) {
-        continue;
-      }
-      const rows = JSON.parse(result.stdout) as unknown;
-      if (!Array.isArray(rows)) {
-        continue;
-      }
-      cookies.push(
-        ...rows.filter(isRecord).map((row) => ({
-          name: String(row.name ?? ""),
-          value: String(row.value ?? ""),
-          domain: typeof row.domain === "string" ? row.domain : undefined,
-          path: typeof row.path === "string" ? row.path : undefined,
-          source: `Firefox:${basename(cookieFile)}`,
-        })),
-      );
-    } catch {
-      continue;
-    } finally {
-      await rm(tempDir, { recursive: true, force: true });
-    }
-  }
-  return cookies;
-}
-
-async function chromiumCookieFiles(
-  browser: "Chrome" | "Brave" | "Edge",
-  options: AuthOptions,
-): Promise<string[]> {
-  const files: string[] = [];
-  for (const root of chromiumUserDataDirs(browser, options)) {
-    const profiles = await profileDirs(root);
-    for (const profile of profiles) {
-      for (const relative of ["Cookies", "Network/Cookies"]) {
-        const file = join(root, profile, relative);
-        if (await isFile(file)) {
-          files.push(file);
-        }
-      }
-    }
-  }
-  return files;
-}
-
-function chromiumUserDataDirs(browser: "Chrome" | "Brave" | "Edge", options: AuthOptions): string[] {
-  const home = options.homeDir ?? homedir();
-  const platform = options.platform ?? process.platform;
-  const dirs = {
-    darwin: {
-      Chrome: ["Library/Application Support/Google/Chrome"],
-      Brave: ["Library/Application Support/BraveSoftware/Brave-Browser"],
-      Edge: ["Library/Application Support/Microsoft Edge"],
-    },
-    linux: {
-      Chrome: [".config/google-chrome", ".var/app/com.google.Chrome/config/google-chrome"],
-      Brave: [".config/BraveSoftware/Brave-Browser", ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"],
-      Edge: [".config/microsoft-edge"],
-    },
-    win32: {
-      Chrome: ["AppData/Local/Google/Chrome/User Data"],
-      Brave: ["AppData/Local/BraveSoftware/Brave-Browser/User Data"],
-      Edge: ["AppData/Local/Microsoft/Edge/User Data"],
-    },
-  } as const;
-
-  return [...(dirs[platform as keyof typeof dirs]?.[browser] ?? [])].map((part) => join(home, part));
-}
-
-async function firefoxCookieFiles(options: AuthOptions): Promise<string[]> {
-  const home = options.homeDir ?? homedir();
-  const platform = options.platform ?? process.platform;
-  const roots = {
-    darwin: ["Library/Application Support/Firefox/Profiles"],
-    linux: [".mozilla/firefox"],
-    win32: ["AppData/Roaming/Mozilla/Firefox/Profiles"],
-  } as const;
-
-  const files: string[] = [];
-  for (const rootPart of roots[platform as keyof typeof roots] ?? []) {
-    const root = join(home, rootPart);
-    for (const profile of await profileDirs(root, true)) {
-      const file = join(root, profile, "cookies.sqlite");
-      if (await isFile(file)) {
-        files.push(file);
-      }
-    }
-  }
-  return files;
-}
-
-async function profileDirs(root: string, allowAnyDirectory = false): Promise<string[]> {
-  let entries: Array<{ name: string; isDirectory(): boolean }>;
-  try {
-    entries = (await readdir(root, { withFileTypes: true })) as Array<{ name: string; isDirectory(): boolean }>;
-  } catch {
-    return [];
-  }
-
-  return entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .filter((name) => allowAnyDirectory || name === "Default" || name === "Guest Profile" || name.startsWith("Profile "));
-}
-
-async function isFile(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isFile();
-  } catch {
-    return false;
-  }
-}
-
-async function importChromeCookiesSecure(): Promise<ChromeCookiesSecure | null> {
-  try {
-    const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>;
-    const module = (await dynamicImport("chrome-cookies-secure")) as { default?: ChromeCookiesSecure } & ChromeCookiesSecure;
-    return (module.default ?? module) as ChromeCookiesSecure;
-  } catch {
-    return null;
-  }
-}
-
-async function readOktaCookies(
-  executable: string,
-  baseUrl: string,
-  execFile: ExecFile,
-): Promise<MoodleSessionCookie[]> {
-  const payload = await runOktaJson(executable, ["cookies", baseUrl], execFile);
-  if (!payload) {
-    return [];
-  }
-
-  const cookies = Array.isArray(payload.cookies) ? payload.cookies : Array.isArray(payload) ? payload : [];
-  return cookies.filter(isRecord).map((cookie) => ({
-    name: String(cookie.name ?? ""),
-    value: String(cookie.value ?? ""),
-    domain: typeof cookie.domain === "string" ? cookie.domain : undefined,
-    path: typeof cookie.path === "string" ? cookie.path : undefined,
-    source: "okta",
-  }));
-}
-
-async function runOktaJson(
-  executable: string,
-  args: string[],
-  execFile: ExecFile,
-): Promise<Record<string, unknown> | null> {
-  const result = await execFile(executable, [...args, "--json"]);
-  if (result.exitCode !== 0 || !result.stdout.trim()) {
-    return null;
-  }
-  try {
-    const payload = JSON.parse(result.stdout) as unknown;
-    return isRecord(payload) ? payload : null;
-  } catch {
-    return null;
-  }
-}
-
-async function findExecutable(
-  name: string,
-  execFile: ExecFile,
-  platform: NodeJS.Platform = process.platform,
-): Promise<string | null> {
-  const command = platform === "win32" ? "where" : "which";
-  const result = await execFile(command, [name]);
-  if (result.exitCode !== 0) {
-    return null;
-  }
-  return result.stdout.split(/\r?\n/, 1)[0]?.trim() || null;
 }
 
 async function firstValidSession(
@@ -502,22 +618,113 @@ async function refreshSessionCache(
   const session: CachedSession = {
     baseUrl,
     cookieName: cookie.name,
+    cookieSource: cookie.source,
     cookieValue: cookie.value,
     sesskey: context.sesskey,
     userid: context.userid,
     savedAt: (options.now ?? Date.now)(),
   };
   try {
+    // Keep what the previous session learned about this account: the services
+    // the site disables, the dashboard profile, and the durable mobile token all
+    // survive an expired cookie.
+    const previous = await readCachedSession(baseUrl, { ...cacheOptions(options), allowExpired: true });
+    // Mobile-service support is a property of the instance, not the account, so
+    // carry it across a login even when the user changed.
+    if (typeof previous?.mobileServiceEnabled === "boolean") session.mobileServiceEnabled = previous.mobileServiceEnabled;
+    if (previous?.userid === context.userid) {
+      if (previous.unavailable?.length) session.unavailable = previous.unavailable;
+      if (previous.user) session.user = previous.user;
+      // Only carry forward a token that can actually renew. A token without a
+      // privatetoken is useless for the autologin key, so dropping it lets the
+      // capture below fetch a real one instead of pinning the dead value.
+      if (previous.mobileToken?.privatetoken) session.mobileToken = previous.mobileToken;
+    }
+    // A genuinely new cookie is worth one attempt to obtain a durable mobile
+    // token; steady-state re-validation of the same cookie must not re-ask, and a
+    // site already known not to offer the service is never probed again.
+    const newCookie = !previous || previous.cookieValue !== cookie.value;
+    if (!session.mobileToken && newCookie && options.captureMobileToken && session.mobileServiceEnabled !== false) {
+      const captured = await captureMobileToken(baseUrl, cookie, options);
+      session.mobileServiceEnabled = captured.supported;
+      if (captured.token) session.mobileToken = captured.token;
+    }
     await writeCachedSession(session, cacheOptions(options));
   } catch {
     return;
   }
 }
 
+/**
+ * Detect whether the instance offers the mobile web service and, if so, trade
+ * the live session for a durable token. Best-effort: on any failure we report
+ * support as unknown-but-not-false so a later login can retry.
+ */
+async function captureMobileToken(
+  baseUrl: string,
+  cookie: MoodleSessionCookie,
+  options: AuthOptions,
+): Promise<{ supported?: boolean; token?: MobileToken }> {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  try {
+    const config = await readMobilePublicConfig(baseUrl, fetchImpl);
+    if (config && !config.mobileServiceEnabled) return { supported: false };
+    const token = (await fetchMobileToken(baseUrl, cookie, fetchImpl)) ?? undefined;
+    // With a readable config, trust its flag; otherwise a minted token is itself
+    // proof of support, and no token leaves support undetermined for next time.
+    return { supported: config?.mobileServiceEnabled ?? (token ? true : undefined), token };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Mint a fresh session cookie from a stored durable token and confirm it is a
+ * real login for the same account. Shared by the cold-read path and the
+ * background keepalive so both apply the same anti-anonymous-page guard.
+ */
+export async function mintValidatedSession(
+  baseUrl: string,
+  stored: Pick<CachedSession, "userid" | "mobileToken">,
+  options: AuthOptions = {},
+): Promise<{ cookie: MoodleSessionCookie; context: SessionValidation } | null> {
+  if (!stored.mobileToken?.privatetoken) return null;
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  const minted = await mintSessionFromMobileToken(baseUrl, stored.userid, stored.mobileToken, fetchImpl);
+  if (!minted) return null;
+  const cookie: MoodleSessionCookie = { name: minted.cookie.name, value: minted.cookie.value, source: minted.cookie.source };
+  const validate = options.validateSession ?? validateSessionWithFetch(options);
+  const context = await validate(baseUrl, cookie);
+  // A login/anonymous page also carries a sesskey but userid 0; accept the mint
+  // only when it produced a genuine session for the same account.
+  if (!context || context.userid === 0 || context.userid !== stored.userid) return null;
+  return { cookie, context };
+}
+
+/** Try to renew via a stored durable token before touching the OS cookie store. */
+async function mintFromStoredToken(
+  baseUrl: string,
+  options: AuthOptions,
+  validate: SessionValidator,
+): Promise<AuthenticatedSession | null> {
+  let stored: CachedSession | null;
+  try {
+    // Honours noCache: a forced fresh login never silently reuses the token.
+    stored = await readCachedSession(baseUrl, { ...cacheOptions(options), allowExpired: true });
+  } catch {
+    return null;
+  }
+  if (!stored?.mobileToken?.privatetoken) return null;
+  const result = await mintValidatedSession(baseUrl, stored, { ...options, validateSession: validate });
+  if (!result) return null;
+  await refreshSessionCache(baseUrl, result.cookie, result.context, options);
+  return { baseUrl, cookie: result.cookie, ...result.context, fromCache: false };
+}
+
 function cachedSessionToAuth(baseUrl: string, cached: CachedSession): AuthenticatedSession {
   return {
     baseUrl,
-    cookie: { name: cached.cookieName, value: cached.cookieValue, source: "cache" },
+    cookie: { name: cached.cookieName, value: cached.cookieValue, source: cached.cookieSource ?? "cache" },
     sesskey: cached.sesskey,
     userid: cached.userid,
     fromCache: true,
@@ -547,11 +754,11 @@ function cookieHostRank(domain: string | undefined, host: string): number | null
   return null;
 }
 
-function loginUrl(baseUrl: string): string {
+export function loginUrl(baseUrl: string): string {
   return new URL(LOGIN_PATH, `${baseUrl.replace(/\/+$/, "")}/`).toString();
 }
 
-function isLoginRedirect(responseUrl: string, baseUrl: string): boolean {
+export function isLoginRedirect(responseUrl: string, baseUrl: string): boolean {
   if (!responseUrl) {
     return false;
   }
@@ -582,18 +789,3 @@ function decodeHtml(value: string): string {
     .replace(/&gt;/g, ">");
 }
 
-const defaultExecFile: ExecFile = (file: string, args: string[]) =>
-  new Promise((resolve) => {
-    execFileCallback(file, args, { encoding: "utf8" }, (error, stdout, stderr) => {
-      const errorWithCode = error as (Error & { code?: number | string }) | null;
-      resolve({
-        stdout: String(stdout ?? ""),
-        stderr: String(stderr ?? ""),
-        exitCode: errorWithCode ? Number(errorWithCode.code) || 1 : 0,
-      });
-    });
-  });
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}

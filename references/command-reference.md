@@ -1,47 +1,104 @@
 # Command Reference
 
-Read this file for exact arguments, flags, and defaults after selecting a branch from `SKILL.md`.
+Generated from the live command tree. UNIT is a code/name, id or URL from `moodle units`.
+`moodle UNIT SECTION` resolves a section; `moodle UNIT "TASK"` resolves an item.
+Resources, folders and assignments return `files` with names and URLs.
+`moodle download REF --to DIR` saves one file, every file of an activity, or a whole
+section (`moodle download "UNIT week 3"` or a section URL). The receipt lists `files`
+with path, byte count and content type, and `skipped` with a reason: `exists` (already
+saved; `--force` replaces it) or `unavailable`. `--dest PATH` names the file when there is one.
+`moodle submit "UNIT TASK" FILE... --dry-run` shows the upload plan; without `--dry-run` it
+asks for confirmation (`--yes` skips it) and prints the receipt Moodle shows afterwards.
+`--final` also submits for grading, which Moodle does not let anyone undo.
 
 | Command | Description | Arguments | Flags |
 | --- | --- | --- | --- |
-| moodle activities | List activities in a course. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle alerts | List notifications and message counts. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required)<br>--mark-read |
-| moodle assign | Show assignment details. | <assign> | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle activities | Inspect activities. |  |  |
+| moodle activities list | List activities in a unit; narrow by section. | <unit> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--section (value required)<br>--limit (value required)<br>--include-labels |
+| moodle activities show | Show activity details, including the files moodle download would save. | <id> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle alerts | List notifications and message counts. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (value required) |
+| moodle attempt | Each question with your response, and mark, correct answer and feedback when the site shows them. | <ref> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
 | moodle auth | Session and keepalive utilities. |  |  |
-| moodle auth keepalive | Renew the Moodle session once; used by the background keepalive agent. |  | --no-renew<br>--json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle auth keepalive install | Install a macOS launch agent that renews the session periodically. |  | --interval (value required)<br>--json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle auth keepalive status | Show whether the keepalive launch agent is installed. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle auth keepalive uninstall | Remove the keepalive launch agent. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle auth login | Force a fresh login and refresh the session cache. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle auth status | Show cached session freshness and keepalive state. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle calendar | Show calendar events (upcoming by default). |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--month (value required)<br>--course (value required)<br>--ics (value required) |
-| moodle choice | Show a choice activity, or vote with --answer. | <choice> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--answer (value required) |
-| moodle complete | Manually mark an activity as complete. | <activity> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--undo |
-| moodle course | Show course detail with sections. | <course> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle courses | List enrolled courses. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle download | Download resources, folders, Pages with attachments, a course week, or a whole course. | [target] [week] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--dir (default: .; value required)<br>--force<br>--dry-run |
-| moodle export | Export course pages, links, and files to a local directory. | <course> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--dir (default: .; value required)<br>--force |
-| moodle feedback | List feedback questions, or fill it in with --answer. | <feedback> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--answer (value required) |
-| moodle folder | Show folder details. | <folder> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle forum | Forum utilities. |  |  |
-| moodle forum check | Validate discussion rendering. | <forum> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
-| moodle forum discussion | Show posts in a forum discussion. | <discussion> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--post (value required)<br>--body |
-| moodle forum discussions | List discussions from a forum. | <forum> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 50; value required)<br>--query (value required) |
-| moodle forum find | Find the best forum match. | <query> | --list<br>--body<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--forum (value required)<br>--titles-only<br>--unread-only<br>--recent<br>--limit-forums (value required)<br>--limit-discussions (value required)<br>--limit (default: 5; value required) |
-| moodle forum forums | List forum activities. | [query] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--limit (default: 50; value required) |
-| moodle forum search | Search forum discussion titles and post text. | <query> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--forum (value required)<br>--titles-only<br>--unread-only<br>--recent<br>--limit-forums (value required)<br>--limit-discussions (value required)<br>--limit (default: 20; value required) |
-| moodle grades | Show grade details for a course, or an all-course overview. | [course] | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle link | Show link details. | <link> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle messages | List message conversations, or show one conversation. | [conversation] | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required) |
-| moodle overview | Show a compact multi-source overview. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--todo-limit (default: 5; value required)<br>--todo-days (value required)<br>--alerts-limit (default: 5; value required) |
-| moodle page | Show page details. | <page> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle quiz | Show quiz details. | <quiz> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle resource | Show resource details. | <resource> | --json<br>--yaml<br>--table<br>--fields (value required) |
-| moodle search | Search activity and section names/descriptions across courses. | <query> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--course (value required)<br>--limit (default: 20; value required) |
+| moodle auth keepalive | Renew the Moodle session once; used by the background keepalive agent. |  | --no-renew<br>--pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth keepalive install | Install a macOS launch agent that renews the session periodically. |  | --interval (value required)<br>--pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth keepalive status | Show whether the keepalive launch agent is installed. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth keepalive uninstall | Remove the keepalive launch agent. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth login | Sign in through a browser the CLI controls, then capture the session. |  | --paste<br>--pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle auth status | Show cached session freshness and keepalive state. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle commands | Describe the complete command tree. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle completion | Print shell completion for zsh, bash or fish. | <shell> |  |
+| moodle doctor | Diagnose runtime, browser access, session, background jobs and MCP setup. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle download | Download files: one activity, a whole section, or a file URL. With no argument, browse. | [ref...] | --to (value required)<br>--dest (value required)<br>--force<br>--pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle due | Items due in a date window. | [unit] | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--days (value required)<br>--limit (value required) |
+| moodle find | Ranked sections, activities and discussion subjects. | <query> [unit] | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (value required)<br>--types (value required) |
+| moodle forums | Inspect forums. |  |  |
+| moodle forums list | List forum activities in a unit. | <unit> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (value required) |
+| moodle forums search | Search forum discussion titles and post text. | <query> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--unit (value required)<br>--course (value required)<br>--forum (value required)<br>--titles-only<br>--unread-only<br>--recent<br>--limit-forums (value required)<br>--limit-discussions (value required)<br>--limit (value required) |
+| moodle forums show | List discussions from a forum. | <forum> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (value required)<br>--query (value required) |
+| moodle grades | Inspect grades. |  |  |
+| moodle grades list | Show grade details for a unit. | [unit] | --graded-only<br>--pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle mcp | Deploy a private MCP Worker on Cloudflare; encrypted session storage and local renewal. Free-tier limits apply. |  |  |
+| moodle mcp bridge | Bridge a stdio MCP client to the managed remote server. |  | --profile (value required) |
+| moodle mcp clients | List pending and approved OAuth clients. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle mcp connect | Connect a supported MCP client. | [client] | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--mode (value required)<br>--show-token |
+| moodle mcp deploy | Deploy or update the managed Moodle MCP server. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--dry-run<br>--repair<br>--rotate-key<br>--rotate-token<br>--rollback |
+| moodle mcp login | Acquire and upload a fresh Moodle session. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle mcp pair | Open a pairing window so Claude can connect to the remote MCP server. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle mcp remove | Remove one managed Moodle MCP deployment. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle mcp renewal | Run the installed managed-session renewal job. |  |  |
+| moodle mcp renewal run | Check and renew one managed Moodle session. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--profile (value required) |
+| moodle mcp revoke | Revoke an OAuth client or all OAuth access. | [client-id] | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--all |
+| moodle mcp serve | Run the local Moodle MCP server over stdio. |  | --stdio |
+| moodle mcp session | Advanced managed-session operations. |  |  |
+| moodle mcp session push | Upload a Moodle cookie from standard input. |  | --stdin<br>--pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle mcp status | Show local and remote Moodle MCP readiness. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--verbose<br>--logs |
+| moodle news | Latest announcement threads with first-post text. | [unit] | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (value required) |
+| moodle open | Open a unit or activity reference in the browser. | <ref> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle overview | Show a compact multi-source overview. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--todo-limit (value required)<br>--todo-days (value required)<br>--alerts-limit (value required) |
+| moodle quiz | Take a quiz: start an attempt, answer questions, finish it. Beta. |  |  |
+| moodle quiz answer | Save one answer: option letters for a choice question (b, or a,c), the text otherwise. | <attempt> <quiz> <question> [answer] | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--from (value required) |
+| moodle quiz finish | Submit the attempt for grading. Moodle does not allow undoing this. | <attempt> <quiz> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle quiz show | Show one page of an attempt in progress: questions, options and saved answers. | <attempt> <quiz> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--page (value required) |
+| moodle quiz start | Start a new attempt, or continue the one in progress, and show its first page. | <ref> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--password (value required) |
 | moodle skills | Show skill metadata or delegate to the shared skills CLI. |  |  |
 | moodle skills add | Install the published skill through npx skills add. |  |  |
 | moodle skills generate | Regenerate the agent skill bundle from the CLI command tree. |  |  |
-| moodle submit | Upload files to an assignment submission (saves the submission; add --submit to lock it in for grading). | <assign> <files...> | --json<br>--yaml<br>--table<br>--fields (value required)<br>--submit<br>--confirm |
-| moodle todo | List upcoming actionable timeline items. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (default: 20; value required)<br>--days (value required) |
-| moodle update | Check for updates and upgrade the installed CLI. |  | --json<br>--yaml<br>--table<br>--fields (value required)<br>--check-only |
-| moodle user | Show authenticated user info. |  | --json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle submit | Upload local files into an assignment; returns the receipt Moodle shows afterwards. | <ref> [files...] | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--final<br>--replace<br>--accept-statement |
+| moodle threads | Inspect forum discussion threads. |  |  |
+| moodle threads show | Show posts in a forum discussion. | <discussion> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (value required)<br>--offset (value required)<br>--post (value required)<br>--body |
+| moodle todo | List upcoming actionable timeline items. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--limit (value required)<br>--days (value required) |
+| moodle uninstall | Remove local background jobs; optionally remove the selected Worker and configuration. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--remote<br>--purge |
+| moodle units | Inspect enrolled units. |  |  |
+| moodle units list | List enrolled units. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle units show | Show unit detail with sections. | <unit> | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+| moodle update | Update the package and redeploy the managed MCP Worker when either is behind. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required)<br>--check<br>--quiet |
+| moodle user | Show authenticated user info. |  | --pretty<br>--json<br>--yaml<br>--table<br>--fields (value required) |
+
+### Output Contract
+
+- `--json` and piped output write compact JSON. `--pretty` indents it.
+- `--yaml` writes YAML to stdout when supported.
+- `--table` forces human-readable table/tree output.
+- When stdout is not a TTY, commands default to JSON unless `--table` is set.
+- `--fields a,b,c` keeps only listed top-level fields. Use envelope keys such as `units`, `due`, `item`, and `total`.
+- Invalid `--fields` values are usage errors and list valid fields.
+- Structured errors use `{ok:false,error:{code,message,hint},exit_code}` on stderr.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Network, configuration, or unexpected error |
+| 2 | Usage error |
+| 3 | Authentication error |
+| 4 | Requested course, activity, forum, or discussion was not found |
+| 5 | Moodle rejected a well-formed request |
+
+MCP 0.8 discovers home, due, units, unit, find, item, grades, news, thread,
+search_forums and file; a local server also lists submit, the only tool that writes.
+Legacy names remain callable for one minor version and return
+compact v2 envelopes. They are deprecated and omitted from default discovery.
+Unit results contain a section index; supply section for activity details.
+List activity URLs follow `{siteurl}/mod/{type}/view.php?id={id}`; use item for the actual URL.
+File content is embedded in MCP resource blocks, limited to 16 MiB. CLI downloads stream to disk.

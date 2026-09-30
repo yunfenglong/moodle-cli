@@ -1,9 +1,11 @@
+import { runtimeCommand, selfCommand, runtimeSupportsCookies } from "./mcp/self-command.js";
+import { fetchWithSession } from "./session-fetch.js";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { getAuthenticatedSession } from "./auth.js";
+import { getAuthenticatedSession, mintValidatedSession, MINIMUM_NODE_FOR_BROWSER_COOKIES } from "./auth.js";
 import {
   AJAX_SERVICE_PATH,
   CACHE_DIR_NAME,
@@ -13,7 +15,7 @@ import {
   KEEPALIVE_LAUNCH_AGENT_LABEL,
   KEEPALIVE_LOG_FILENAME,
 } from "./constants.js";
-import { readCachedSession, writeCachedSession } from "./session-cache.js";
+import { readCachedSession, writeCachedSession, type CachedSession } from "./session-cache.js";
 
 export interface TouchResult {
   alive: boolean | null;
@@ -27,6 +29,7 @@ export interface KeepaliveRunResult {
 
 export interface AuthStatus {
   base_url: string;
+  cookie_source?: string;
   session_cached: boolean;
   cache_age_minutes: number | null;
   session_alive: boolean | null;
@@ -63,6 +66,7 @@ export interface KeepaliveInstallOptions {
   argv1?: string;
   uid?: number;
   runCommand?: typeof spawnSync;
+  canReadBrowserCookies?: boolean;
 }
 
 export async function touchMoodleSession(
@@ -76,14 +80,14 @@ export async function touchMoodleSession(
   const url = `${baseUrl.replace(/\/$/, "")}${AJAX_SERVICE_PATH}?sesskey=${encodeURIComponent(sesskey)}&info=${methods.join(",")}`;
   let response: Response;
   try {
-    response = await fetchImpl(url, {
+    response = await fetchWithSession(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         cookie: `${cookie.name}=${cookie.value}`,
       },
       body: JSON.stringify(methods.map((methodname, index) => ({ index, methodname, args: {} }))),
-    });
+    }, baseUrl, cookie, fetchImpl);
   } catch {
     return { alive: null, timeRemainingSeconds: null };
   }
@@ -123,19 +127,21 @@ export async function touchMoodleSession(
 export async function keepAliveOnce(baseUrl: string, options: KeepaliveOptions = {}): Promise<KeepaliveRunResult> {
   const session = await readCachedSession(baseUrl, {
     homeDir: options.homeDir,
-    ttlMs: Number.MAX_SAFE_INTEGER,
+    allowExpired: true,
     now: options.now,
   });
   if (!session) {
     return { status: "no_session", time_remaining_seconds: null };
   }
 
-  const touch = await touchMoodleSession(
-    baseUrl,
-    { name: session.cookieName, value: session.cookieValue },
-    session.sesskey,
-    options.fetchImpl ?? fetch,
-  );
+  const touch = session.cookieInvalidated
+    ? { alive: false, timeRemainingSeconds: null }
+    : await touchMoodleSession(
+        baseUrl,
+        { name: session.cookieName, value: session.cookieValue },
+        session.sesskey,
+        options.fetchImpl ?? fetch,
+      );
   if (touch.alive === true) {
     await writeCachedSession({ ...session, savedAt: (options.now ?? Date.now)() }, { homeDir: options.homeDir });
     return { status: "renewed", time_remaining_seconds: touch.timeRemainingSeconds };
@@ -147,6 +153,14 @@ export async function keepAliveOnce(baseUrl: string, options: KeepaliveOptions =
     return { status: "expired", time_remaining_seconds: null };
   }
 
+  // A durable mobile token renews the cookie with no browser at all, which is
+  // the only renewal a background job can do unattended. Try it before the
+  // cookie-store path, which cannot run headless.
+  if (session.mobileToken) {
+    const renewed = await renewViaMobileToken(baseUrl, session, options);
+    if (renewed) return renewed;
+  }
+
   const authenticate = options.authenticate
     ?? ((url: string) =>
       getAuthenticatedSession(url, {
@@ -154,7 +168,7 @@ export async function keepAliveOnce(baseUrl: string, options: KeepaliveOptions =
         fetch: options.fetchImpl,
         noCache: true,
         now: options.now,
-        // Background runs must never block on an interactive Okta login.
+        // Background runs must never block on an interactive browser login.
         nonInteractive: true,
       }));
   try {
@@ -165,12 +179,42 @@ export async function keepAliveOnce(baseUrl: string, options: KeepaliveOptions =
   }
 }
 
+/**
+ * Mint a fresh session cookie from the stored mobile token and cache it with a
+ * newly resolved sesskey. Returns null when the site no longer offers the
+ * service or the token was revoked, so the caller falls back to a real login.
+ */
+async function renewViaMobileToken(
+  baseUrl: string,
+  session: CachedSession,
+  options: KeepaliveOptions,
+): Promise<KeepaliveRunResult | null> {
+  // A network fault mid-mint is not a dead token; treat it as "cannot renew now"
+  // and let the caller fall back rather than crashing the keepalive tick.
+  const result = await mintValidatedSession(baseUrl, session, { fetch: options.fetchImpl }).catch(() => null);
+  if (!result) return null;
+
+  await writeCachedSession(
+    {
+      ...session,
+      cookieInvalidated: false,
+      cookieName: result.cookie.name,
+      cookieValue: result.cookie.value,
+      cookieSource: result.cookie.source,
+      sesskey: result.context.sesskey,
+      savedAt: (options.now ?? Date.now)(),
+    },
+    { homeDir: options.homeDir },
+  );
+  return { status: "reauthenticated", time_remaining_seconds: null };
+}
+
 export async function getAuthStatus(baseUrl: string, options: KeepaliveOptions = {}): Promise<AuthStatus> {
   const now = options.now ?? Date.now;
   const keepalive = await keepaliveStatus(options.homeDir);
   const session = await readCachedSession(baseUrl, {
     homeDir: options.homeDir,
-    ttlMs: Number.MAX_SAFE_INTEGER,
+    allowExpired: true,
     now: options.now,
   });
   if (!session) {
@@ -185,16 +229,19 @@ export async function getAuthStatus(baseUrl: string, options: KeepaliveOptions =
     };
   }
 
-  const touch = await touchMoodleSession(
-    baseUrl,
-    { name: session.cookieName, value: session.cookieValue },
-    session.sesskey,
-    options.fetchImpl ?? fetch,
-    false,
-  );
+  const touch = session.cookieInvalidated
+    ? { alive: false, timeRemainingSeconds: null }
+    : await touchMoodleSession(
+        baseUrl,
+        { name: session.cookieName, value: session.cookieValue },
+        session.sesskey,
+        options.fetchImpl ?? fetch,
+        false,
+      );
   return {
     base_url: baseUrl,
     session_cached: true,
+    cookie_source: session.cookieSource ?? "unknown",
     cache_age_minutes: Math.max(0, Math.round((now() - session.savedAt) / 60000)),
     session_alive: touch.alive,
     session_time_remaining_seconds: touch.timeRemainingSeconds,
@@ -212,12 +259,8 @@ export function keepaliveLogPath(homeDir = homedir()): string {
 }
 
 export function keepaliveProgramArguments(execPath = process.execPath, argv1 = process.argv[1] ?? ""): string[] {
-  const resolvedArgv1 = argv1 ? safeRealpath(argv1) : "";
-  const tail = ["auth", "keepalive", "--json"];
-  if (!resolvedArgv1 || resolvedArgv1 === safeRealpath(execPath)) {
-    return [execPath, ...tail];
-  }
-  return [execPath, resolvedArgv1, ...tail];
+  const selected = arguments.length ? selfCommand([execPath, argv1 ? safeRealpath(argv1) : ""], execPath) : runtimeCommand();
+  return [selected.command, ...selected.args, "auth", "keepalive", "--json"];
 }
 
 export function buildKeepalivePlist(programArguments: string[], intervalMinutes: number, logPath: string): string {
@@ -255,11 +298,23 @@ export async function installKeepalive(options: KeepaliveInstallOptions = {}): P
     );
   }
 
+  // The plist bakes in the runtime that installed it. A runtime that cannot read
+  // browser cookies still renews a live session, so the install looks healthy and
+  // only fails once the session expires and there is nothing left to renew from.
+  const selectedRuntime = options.execPath ? selfCommand([options.execPath, options.argv1 ?? ""], options.execPath) : runtimeCommand();
+  const readsCookies = options.canReadBrowserCookies ?? (!selectedRuntime.args.length || runtimeSupportsCookies(selectedRuntime.command));
+  if (!readsCookies) {
+    throw new Error(
+      `This runtime (${process.version}) cannot read browser cookies, and the launch agent would be pinned to it. `
+        + `Reinstall with Node.js ${MINIMUM_NODE_FOR_BROWSER_COOKIES} or newer, or with Bun.`,
+    );
+  }
+
   const homeDir = options.homeDir ?? homedir();
   const intervalMinutes = options.intervalMinutes ?? KEEPALIVE_DEFAULT_INTERVAL_MINUTES;
   const plistPath = keepalivePlistPath(homeDir);
   const logPath = keepaliveLogPath(homeDir);
-  const command = keepaliveProgramArguments(options.execPath, options.argv1);
+  const command = [selectedRuntime.command, ...selectedRuntime.args, "auth", "keepalive", "--json"];
 
   await mkdir(dirname(plistPath), { recursive: true });
   await mkdir(dirname(logPath), { recursive: true, mode: 0o700 });

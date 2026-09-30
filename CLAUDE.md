@@ -20,55 +20,86 @@ Interpret these as defaults:
 
 ## Build & Run
 
+TypeScript ESM, Node >= 22.13. The `moodle` bin maps to `dist/moodle.js`.
+
 ```bash
-npm ci                  # install dependencies
-npm run check           # typecheck (tsc --noEmit)
-npm test                # vitest run
-npm run build           # typecheck + tsup bundle → dist/moodle.js
-node dist/moodle.js     # run built CLI
+npm install
+npm run check        # tsc --noEmit
+npm test             # vitest run
+npm run build        # tsc --noEmit + tsup (CLI) + tsup.worker (Worker) + bundle check
+npm run pack:check   # assert the npm tarball carries every shipped file
 ```
 
-TypeScript (ESM, Node >= 20), bundled by tsup into a single `dist/moodle.js` (the `moodle` bin). No linter/formatter is configured. CI (`.github/workflows/ci.yml`) runs typecheck, tests, build, npm-pack content/smoke checks, and a skill-bundle drift check on Node 20/22 and Bun.
+Narrower test lanes: `npm run test:mcp`, `npm run test:worker`, `npm run test:watch`.
+
+Run the CLI from source with `node --experimental-strip-types src/cli.ts`, or `node dist/moodle.js` after a build.
+
+`prepublishOnly` runs test + build + pack:check, so a release fails early rather than shipping a broken tarball.
 
 ## Architecture
 
-Terminal CLI for Moodle LMS that piggybacks on the user's browser session — no API tokens needed.
+Two deliverables live in one repo:
 
-### API Strategy
+1. **The CLI** (`src/`) — reads Moodle by borrowing the user's browser session.
+2. **The Worker** (`src/worker/`) — a Cloudflare Worker that exposes the same data over MCP, deployed by the CLI through a bundled Wrangler.
 
-Uses Moodle's **internal AJAX endpoint** (`/lib/ajax/service.php`), not the official Web Services token API. This endpoint accepts the `MoodleSession` browser cookie, same as the Moodle web UI. The client first loads an authenticated page to resolve `sesskey`, then tries AJAX APIs and falls back to page scraping when site-specific Moodle restrictions disable some services.
+### Moodle access
 
-Request format: `POST /lib/ajax/service.php?sesskey={sesskey}&info={function_name}` with JSON body `[{"index": 0, "methodname": "...", "args": {...}}]`. Response: `[{"error": false, "data": ...}]`.
+The CLI uses Moodle's **internal AJAX endpoint** (`/lib/ajax/service.php`), not the Web Services token API. That endpoint accepts the `MoodleSession` browser cookie, exactly as the web UI does. `client.ts` resolves `sesskey` from an authenticated page, then calls AJAX functions and falls back to scraping (`scraper.ts`) when a site disables a service.
 
-### Data Flow
+Request: `POST /lib/ajax/service.php?sesskey={sesskey}&info={function}` with body `[{"index":0,"methodname":"...","args":{...}}]`. Response: `[{"error":false,"data":...}]`.
 
-```
-auth.ts (get cookie) → client.ts (AJAX calls, scraping fallback) → parsers.ts / scraper.ts (→ models) → formatters.ts / output.ts (display)
-        ↑                     ↑
-   env var, browser      sesskey + userid auto-resolved;
-   cookies, or cached    session cached in ~/.cache/moodle-cli/session.json
-   session
-```
+### CLI layout
 
-- **cli.ts**: Commander program. `buildProgram(io)` takes injectable IO (stdout/stderr/fetch/env/homeDir) so tests can drive the full CLI. `runCli()` maps errors (`CliError` hierarchy in errors.ts) to exit codes and JSON error output. A bare URL argument dispatches to the matching command via url-resolver.ts.
-- **auth.ts**: Cookie priority: `MOODLE_SESSION` env var → cached session → browser cookie extraction. Sessions persist via **session-cache.ts** (24h TTL, `--no-cache` bypasses reads).
-- **client.ts**: `MoodleClient` — batched AJAX calls (`callBatch`), auto re-auth on session expiry, per-method fallbacks to **scraper.ts** (HTML scraping with node-html-parser) when AJAX functions are disabled server-side.
-- **models.ts**: Plain interfaces with snake_case serialization fields.
-- **parsers.ts**: Pure functions transforming Moodle JSON dicts → model instances. **scraper.ts** does the same from HTML.
-- **formatters.ts**: Human-readable table/tree output. **output.ts**: `--json`/`--yaml`/`--fields` structured output (default is JSON when stdout is not a TTY).
-- **config.ts**: Loads `config.yaml` from CWD or `~/.config/moodle-cli/`. If no `base_url` is configured, it prompts, validates, probes the site, and saves. `MOODLE_BASE_URL` env var overrides.
-- **download.ts / export.ts**: authenticated file downloads (`download` command; resource/folder/assign-submission plans) and whole-course offline export (`export`). **course-search.ts**: client-side search over course contents (`search`). **ics.ts**: local ICS generation for `calendar --ics`.
-- **Write operations** go through the web-form route (cookie + sesskey + hidden-field replay via `parseFormWithField`), not AJAX, because sites disable most mod_* WS functions: **assign-submit.ts** (`submit` — draft upload via /repository/repository_ajax.php then savesubmission; `--submit --confirm` for the confirmsubmit lock step), **choice.ts** (`choice --answer`), **feedback.ts** (`feedback --answer`, multi-page). Completion ticks (`complete`) and `alerts --mark-read` use ajax-enabled core functions directly.
-- **keepalive.ts**: `auth keepalive` commands + macOS launch agent that renews the session periodically.
-- **skills.ts**: Generates the agent skill bundle (`SKILL.md`, `references/`, `agents/openai.yaml`) from the Commander command tree. Regenerate with `npm run skill:generate` after touching commands; CI fails on drift.
-- **constants.ts**: API paths, AJAX function names, env var names.
+- **cli.ts** — Commander program. Top-level: `user`, `units` (alias `courses`), `todo`, `alerts`, `overview`, `activities`, `download` (alias `dl`), `grades`, `threads`, `forums`, `auth`, `mcp`, `commands`, `skills`. Session handling sits under `auth`; deployment under `mcp`.
+- **auth.ts** — session resolution. `MOODLE_SESSION` env var, then browser cookie extraction, then an interactive browser login. Browser cookies need Node >= 22.13 (`MINIMUM_NODE_FOR_BROWSER_COOKIES`).
+- **client.ts** / **moodle-client-core.ts** — the API surface; core holds transport-free logic so it runs in both Node and the Worker.
+- **parsers.ts**, **models.ts** — Moodle JSON to typed models.
+- **formatters.ts**, **terminal-table.ts** — human output; every command also takes `--json`.
+- **config.ts**, **url-resolver.ts** — resolve and persist `base_url`; `MOODLE_BASE_URL` overrides.
+- **command-contract.ts** — reflects the Commander tree into a machine-readable description, which is what `skills.ts` generates agent manifests from. Adding a command changes generated output, so regenerate rather than hand-editing.
 
-### Adding a New Command
+Modules ending in `-core.ts` are the runtime-neutral half of a feature. Put logic there when the Worker needs it too; keep Node-only concerns (fs, child_process, keychain) in the sibling file.
 
-1. Add the Moodle AJAX function name / view path to `constants.ts`
-2. Add a method to `MoodleClient` in `client.ts` (scraping fallback in `scraper.ts` if the AJAX function may be disabled)
-3. Add a model interface to `models.ts`, parser to `parsers.ts`
-4. Add a display function to `formatters.ts`
-5. Register the command in `cli.ts` via `addOutputOptions(program.command(...))`
-6. Add a vitest test in `tests/` (mock `fetchImpl` through `buildProgram`/`createMoodleClient` IO injection)
-7. Rebuild (`npm run build`) and run `npm run skill:generate`; commit the regenerated `SKILL.md`/`references/`/`agents/openai.yaml`
+### Worker layout (`src/worker/`)
+
+- **entry.ts** — the Cloudflare entrypoint; **http.ts** — routing, auth, protocol-metadata validation.
+- **auth.ts** — static Bearer tokens compared against digests in secrets. **oauth.ts** / **auth-broker.ts** — a single-user OAuth 2.1 authorization server so hosted clients (claude.ai) can connect; `/oauth/register` is DCR for public clients, PKCE S256 is required, and `/authorize` refuses everything unless the user has opened a pairing window with `moodle mcp pair`.
+- **session-broker.ts** — a Durable Object holding the encrypted Moodle cookie; **crypto.ts** — the envelope around it.
+- **problems.ts** — every error response is RFC 9457 problem+json. `type` is a relative URI (`/problems/...`); do not invent a hostname for it.
+- **moodle-upstream.ts** — the Worker's own Moodle calls.
+
+### MCP protocol
+
+`src/mcp/protocol.ts` is the single source of truth. `MODERN_PROTOCOL_VERSION` (`2026-07-28`) carries `_meta` client metadata and the `MCP-Method` / `MCP-Name` headers; `LEGACY_PROTOCOL_VERSION` and `COMPAT_PROTOCOL_VERSIONS` do not. Hosted clients negotiate the compat revisions, so any header or metadata requirement must be gated on the modern version alone — gating it on "not legacy" silently breaks every real client.
+
+### Deployment (`src/mcp/deployment/`)
+
+`moodle mcp deploy` runs `ONBOARDING_STAGES`, eight steps from validating the Moodle session through uploading secrets, deploying, and installing local integrations. `ManagedMcpDeployment.apply()` is an `AsyncIterable<DeploymentEvent>`; **progress.ts** renders those events as an in-place spinner on a TTY and as plain completed lines everywhere else. Progress goes to **stderr** so `--json` keeps stdout clean.
+
+Credentials live in the OS keychain via `src/mcp/credentials/`. Session renewal is in `src/mcp/renewal/`.
+
+## Conventions
+
+- English comments only; explain why, not what. Conventional Commits.
+- Never log or print the Moodle session cookie, `sesskey`, or an MCP access token.
+- Browser-cookie auth is the general path. Do not add site-specific or provider-specific login flows.
+- No new dependencies without a concrete reason.
+
+## Release Notes
+
+`.github/release-notes/<version>.md` is the GitHub release body. That renderer keeps single newlines as line breaks, so a hard-wrapped paragraph shows up as short ragged lines with a column of dead space on the right. Write one paragraph per line and let the browser wrap it; blank lines separate paragraphs.
+
+Lead with one sentence saying what the release is, then a `## Highlights` bullet list, then a section per change. Use bullets for lists of facts and prose for anything that needs a reason.
+
+## Adding a New Command
+
+1. Register it in `src/cli.ts` with a `--json` option.
+2. Add the AJAX function name to `constants.ts` and a method to `client.ts` (or `moodle-client-core.ts` if the Worker needs it).
+3. Add the model to `models.ts` and the transform to `parsers.ts`.
+4. Add human output to `formatters.ts`.
+5. Add a test; `tests/cli-contract.test.ts` covers the generated contract.
+
+## Adding a New Moodle API Call
+
+All calls go through `MoodleClient._call(function, args)`, which handles the AJAX envelope and error extraction. Add a public method that calls it.

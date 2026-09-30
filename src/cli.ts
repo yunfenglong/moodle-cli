@@ -1,41 +1,79 @@
-import { Command, CommanderError } from "commander";
+import { activitySchema } from "./intent-contract.js";
+import { activityRow, itemRow, postRow, stripEmpty } from "./results.js";
+import { doctor, ownedJobs } from "./doctor.js";
+import { readFile, rm, readdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { DefaultRenewalIntegration } from "./mcp/renewal/index.js";
+import { CACHE_DIR_NAME, CONFIG_DIR_NAME, MOODLE_SESSION_COOKIE_PREFIX } from "./constants.js";
+import { runtimeSupportsCookies } from "./mcp/self-command.js";
+import { createMoodleGateway } from "./mcp/gateway.js";
+import { createIntentService, type IntentService } from "./intents.js";
+import { humanDescription, type Intent } from "./intent-contract.js";
+import { ReferenceError, normalize, resolveSection, splitUnitPhrase, withChildSections, type Candidate } from "./resolve.js";
+import { renderScreen, tryLines } from "./screens.js";
+import type { Writable } from "node:stream";
+import { spawn } from "node:child_process";
+import { Command } from "commander";
+import {
+  banner,
+  colorEnabled,
+  confirm,
+  createProgram,
+  createTheme,
+  createUi,
+  detectAudience,
+  examples,
+  helpSection,
+  insertDefaultVerb,
+  isInformationalExit,
+  parseWithPrompts,
+  render,
+  reportError,
+  normalizeError,
+  resolveFormat,
+  mutating,
+  writeOutput,
+  type ArgumentFiller,
+  type NounSpec,
+  type OutputFormat,
+  type Theme,
+  type Ui,
+} from "@bunizao/cli-kit";
 import { realpathSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createMoodleClient, type MoodleClient } from "./client.js";
+import { refreshLatestVersion, runUpdate, startupUpdateNotice } from "./update-check.js";
+import { isNewerVersion } from "./update-core.js";
 import { loadConfig } from "./config.js";
-import { CliError, ConfigError, MoodleAPIError, UsageError, toCliError } from "./errors.js";
+import { AuthError, CliError, MoodleAPIError, UsageError, asNetworkError } from "./errors.js";
 import {
   formatActivityDetail,
   formatActivityList,
   formatAlerts,
-  formatAssignSubmitResult,
   formatAuthStatus,
-  formatCalendarEvents,
-  formatChoice,
-  formatCompletionResult,
-  formatConversationDetail,
-  formatConversations,
-  formatCourseExport,
-  formatCourseSearchHits,
   formatCourseSections,
   formatCourses,
-  formatDownloadResults,
-  formatFeedbackInfo,
-  formatFeedbackResult,
+  formatAttemptFinish,
+  formatAttemptPage,
+  formatAttemptSummary,
+  formatDownloadResult,
   formatForumDiscussion,
+  formatSubmissionReceipt,
   formatForumDiscussionRefs,
   formatForumActivities,
   formatForumSearchHits,
-  formatForumCheckResults,
   formatGrades,
-  formatGradesOverview,
   formatKeepaliveResult,
   formatTodo,
   formatUser,
 } from "./formatters.js";
-import { serializeStructured, errorJson, type OutputFormat } from "./output.js";
+import { downloadMoodleFiles } from "./download.js";
+import { chooseDownloadSource } from "./download-source.js";
+import { submissionReceiptOf, type SubmissionReceipt } from "./moodle-assign-core.js";
+import type { AttemptPage, QuizStartPlan } from "./moodle-quiz-core.js";
+import { resolveSubmissionPath } from "./submit.js";
 import { formatSkillSummary, installSkill, writeGeneratedSkill } from "./skills.js";
-import { checkForUpdates, applySelfUpdate } from "./update.js";
 import {
   getAuthStatus,
   installKeepalive,
@@ -43,20 +81,18 @@ import {
   keepaliveStatus,
   uninstallKeepalive,
 } from "./keepalive.js";
-import { getAuthenticatedSession, invalidateCachedSession } from "./auth.js";
+import { authenticateWithPastedCookie, getAuthenticatedSession, getAuthenticatedSessionWithBrowserFallback, invalidateCachedSession } from "./auth.js";
+import { browserCookieStores, cookieStoresBlocked } from "./cookie-stores.js";
+import { signInInteractively } from "./onboarding.js";
+import { readSecretLine } from "./secret-input.js";
+import { configureTerminalTables } from "./terminal-table.js";
+import { MOODLE_TAGLINE, MOODLE_WORDMARK, showWordmark } from "./wordmark.js";
 import { VERSION } from "./version.js";
-import { ASSIGN_VIEW_PATH, CHOICE_VIEW_PATH, FEEDBACK_VIEW_PATH, FOLDER_VIEW_PATH, PAGE_VIEW_PATH, QUIZ_VIEW_PATH, RESOURCE_VIEW_PATH, URL_VIEW_PATH } from "./constants.js";
 import { filterDiscussionToPost, parseDiscussionReference, parseForumReference } from "./forum.js";
-import { checkForumDiscussions } from "./forum-search.js";
-import { looksLikeUrl, parseActivityReference, resolveTopLevelUrl } from "./url-resolver.js";
-import { executeDownloads, planDownloads } from "./download.js";
-import { exportCourse } from "./export.js";
-import { submitAssignment } from "./assign-submit.js";
-import { getChoice, voteChoice } from "./choice.js";
-import { completeFeedback, getFeedback } from "./feedback.js";
-import { searchCourseContent } from "./course-search.js";
-import { eventsToIcs } from "./ics.js";
-import { writeFile } from "node:fs/promises";
+import { looksLikeUrl, resolveTopLevelUrl } from "./url-resolver.js";
+import { createMcpCommandService, type McpCommandOutput, type McpCommandService } from "./mcp/cli.js";
+import { describeProgram } from "./command-contract.js";
+import { ONBOARDING_COPY } from "./mcp/deployment/onboarding.js";
 
 interface CliIO {
   stdout?: NodeJS.WriteStream | { write(chunk: string): boolean };
@@ -67,13 +103,19 @@ interface CliIO {
   cwd?: string;
   homeDir?: string;
   rootArgs?: string[];
+  mcpService?: McpCommandService;
 }
 
 interface Runtime {
   client: MoodleClient | null;
+  /** A spinner owns stderr while this is set, so the request indicator stays quiet. */
+  busy: boolean;
   getClient: () => Promise<MoodleClient>;
   baseUrl: () => Promise<string>;
-  output: (data: unknown, formatter: () => string, options: OutputCommandOptions) => void;
+  // hints: false for a receipt, where the generic "Try" commands are noise.
+  output: (data: unknown, formatter: () => string, options: OutputCommandOptions, hints?: boolean) => Promise<void>;
+  screen: (data: Record<string, unknown>, options?: OutputCommandOptions) => string;
+  count: (key: "limit" | "days", local?: number, fallback?: number) => number | undefined;
 }
 
 interface OutputCommandOptions {
@@ -81,90 +123,464 @@ interface OutputCommandOptions {
   yaml?: boolean;
   table?: boolean;
   fields?: string;
+  output?: string;
+  pretty?: boolean;
 }
+
+const NOUNS: readonly NounSpec[] = [
+  { name: "units", aliases: ["courses"], verbs: ["list", "show"], defaultByArity: { 0: "list", 1: "show" } },
+  { name: "activities", verbs: ["list", "show"], defaultByArity: { 0: "list", 1: "list" }, valueFlags: ["--limit", "--section"] },
+  { name: "grades", verbs: ["list"], defaultByArity: { 0: "list", 1: "list" } },
+  {
+    name: "forums",
+    verbs: ["list", "show", "search"],
+    defaultByArity: { 0: "list", 1: "list" },
+    valueFlags: ["--limit", "--course", "--forum", "--limit-forums", "--limit-discussions", "--unit"],
+  },
+  { name: "threads", verbs: ["show"], defaultByArity: { 1: "show" }, valueFlags: ["--post", "--limit", "--offset"] },
+];
 
 export function buildProgram(io: CliIO = {}): Command {
   const stdout = io.stdout ?? process.stdout;
   const stderr = io.stderr ?? process.stderr;
-  const program = new Command("moodle");
-  program.version(VERSION);
-  program.description("Terminal-first CLI for Moodle LMS.");
-  program.exitOverride();
-  program.allowUnknownOption(true);
-  program.allowExcessArguments(true);
+  const program = createProgram({ name: "moodle", version: VERSION, description: MOODLE_TAGLINE });
+  banner(program, MOODLE_WORDMARK);
   program.configureOutput({
     writeOut: (text) => stdout.write(text),
     writeErr: (text) => stderr.write(text),
+    outputError: () => undefined,
   });
-  program.option("-v, --verbose", "Enable debug logging.");
-  program.option("--no-cache", "Bypass session cache reads.");
-  program.argument("[target]", "Supported Moodle URL");
+  program.hook("preAction", (_command, actionCommand) => {
+    resolveFormat(actionCommand.optsWithGlobals(), Boolean(stdout && "isTTY" in stdout && stdout.isTTY));
+  });
+  program.option("--no-cache", "Bypass session cache reads and writes.");
+  program.argument("[target...]", "Unit name, section, item phrase, or Moodle URL");
+  program.option("--pretty", "Indent JSON output.");
+  program.option("--limit <number>", "Maximum returned rows.", parsePositiveInt);
+  program.option("--days <number>", "Deadline window in days.", parsePositiveInt);
+  const verbose = program.options.find(option => option.long === "--verbose");
+  if (verbose) { verbose.short = "-v"; verbose.flags = "-v, --verbose"; }
+  program.showSuggestionAfterError(true);
+
+  // Screens are the only place the terminal's real width matters; one helper keeps
+  // every call site honest about it.
+  const screen = (data: Record<string, unknown>, options: OutputCommandOptions = {}, intent?: Intent) => renderScreen(data, {
+    intent,
+    // Terminals without a size report 0 columns; the default is better than 40.
+    width: (stdout as Partial<NodeJS.WriteStream>).columns || undefined,
+    color: !process.env.NO_COLOR && program.opts().color !== false && outputFormat({ ...program.opts(), ...options }, stdout) === "table",
+  });
+  configureTerminalTables({ color: () => colorEnabled(stdout as { isTTY?: boolean }, io.env) && program.opts().color !== false });
+
+  // Commander hands a flag declared on both the program and a subcommand to the
+  // program, so a local --limit or --days never arrives. What the user typed wins,
+  // then the command's own default.
+  const count = (key: "limit" | "days", local?: number, fallback?: number) => (program.opts()[key] as number | undefined) ?? local ?? fallback;
 
   const runtime: Runtime = {
     client: null,
-    baseUrl: async () => (await loadConfig({ env: io.env, cwd: io.cwd, homeDir: io.homeDir, stdin: io.stdin, fetch: io.fetchImpl })).baseUrl,
+    busy: false,
+    screen,
+    count,
+    baseUrl: async () => (await loadConfig({ env: io.env, cwd: io.cwd, homeDir: io.homeDir, stdin: io.stdin, stderr: stderr as NodeJS.WritableStream, fetch: io.fetchImpl })).baseUrl,
     getClient: async () => {
       if (!runtime.client) {
         const baseUrl = await runtime.baseUrl();
-        runtime.client = await createMoodleClient(baseUrl, {
+        // One indicator for the whole command, however many requests run at once.
+        let inflight = 0;
+        let displayed = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const connect = () => createMoodleClient(baseUrl, {
           env: io.env,
-          fetchImpl: io.fetchImpl,
+          fetchImpl: async (input, init) => {
+            const started = Date.now();
+            const tty = Boolean("isTTY" in stderr && stderr.isTTY) && !program.opts().json && !io.rootArgs?.includes("--json") && !runtime.busy;
+            if (tty && inflight++ === 0) timer = setTimeout(() => { displayed = true; stderr.write("Loading Moodle…"); }, 300);
+            try { return await (io.fetchImpl ?? fetch)(input, init); }
+            finally {
+              if (tty && --inflight === 0) {
+                clearTimeout(timer);
+                if (displayed) { stderr.write("\r\x1b[2K"); displayed = false; }
+              }
+              if (program.opts().verbose) {
+                const url = new URL(input instanceof Request ? input.url : String(input));
+                const methods = url.pathname.endsWith("/lib/ajax/service.php") ? url.searchParams.get("info") ?? "" : "";
+                stderr.write(`${init?.method ?? "GET"} ${url.pathname}${methods ? ` (${methods})` : ""} ${Date.now() - started}ms\n`);
+              }
+            }
+          },
           homeDir: io.homeDir,
           noCache: Boolean(program.opts().cache === false),
         });
+        try {
+          runtime.client = await connect();
+        } catch (error) {
+          // A person with no session is walked through the browser sign-in once; an agent gets the auth error.
+          if (!(error instanceof AuthError) || !human()) throw error;
+          await signIn(baseUrl);
+          runtime.client = await connect();
+        }
       }
       return runtime.client;
     },
-    output: (data, formatter, options) => {
-      const format = outputFormat(options, stdout);
-      if (format === "table") {
-        stdout.write(`${formatter()}\n`);
+    output: async (data, formatter, options, hints = true) => {
+      const merged = { ...program.opts(), ...options } as OutputCommandOptions;
+      const format = outputFormat(merged, stdout);
+      const human = format === "table" ? formatter() : "";
+      const text = format === "table"
+        ? `${human}${!hints || human.includes("Try  ") ? "" : `\n\n${tryLines(["moodle due", "moodle units", "moodle --help"])}`}\n`
+        : format === "json"
+          ? `${JSON.stringify(JSON.parse(render(data, { format, fields: parseFields(data, merged.fields) })), null, merged.pretty ? 2 : undefined)}\n`
+          : render(data, { format, fields: parseFields(data, merged.fields) });
+      if (io.stdout && !merged.output) {
+        stdout.write(text);
       } else {
-        stdout.write(`${serializeStructured(data, { format, fields: options.fields })}\n`);
+        await writeOutput(text, { output: merged.output });
       }
     },
   };
+  let mcpService: McpCommandService | undefined = io.mcpService;
+  const getMcpService = (): McpCommandService => {
+    mcpService ??= createMcpCommandService({
+      env: io.env,
+      cwd: io.cwd,
+      homeDir: io.homeDir,
+      stdin: io.stdin,
+      stdout: stdout as NodeJS.WritableStream,
+      stderr: stderr as NodeJS.WritableStream,
+      fetchImpl: io.fetchImpl,
+      // Progress goes to stderr and the summary to stdout, so both streams must want colour.
+      color: () => colorEnabled(stdout as { isTTY?: boolean }, io.env)
+        && colorEnabled(stderr as { isTTY?: boolean }, io.env)
+        && program.opts().color !== false,
+    });
+    return mcpService;
+  };
 
-  program.action(async (target: string | undefined, options: Record<string, unknown>, command: Command) => {
-    if (!target) {
-      command.help();
-      return;
+  const execute = async (name: Intent, args: Record<string, unknown>, options: OutputCommandOptions = {}, service?: IntentService) => {
+    const runner = service ?? createIntentService(createMoodleGateway(await runtime.getClient()));
+    const result = await runner.run(name, args);
+    await runtime.output(result, () => screen(result, options, name), options);
+  };
+
+  // One rule for who is on the other end: a person at a terminal reading a table. Anyone
+  // else (a pipe, --json, an agent's shell) gets errors with the flag to pass, never a prompt.
+  const human = () => detectAudience({
+    stdin: io.stdin ?? process.stdin,
+    stdout: { isTTY: Boolean(stdout && "isTTY" in stdout && stdout.isTTY) },
+    env: io.env ?? process.env,
+    format: outputFormat(program.opts(), stdout),
+  }) === "human";
+
+  const theme = (): Theme => createTheme(colorEnabled(stderr as { isTTY?: boolean }, io.env) && program.opts().color !== false);
+
+  // First run on this machine: the wordmark, one note, then whichever sign-in the person picks.
+  const signIn = async (baseUrl: string): Promise<void> => {
+    const ui = createUi({ input: io.stdin ?? process.stdin, output: stderr as Writable, interactive: true });
+    const auth = { env: io.env, fetch: io.fetchImpl, homeDir: io.homeDir, captureMobileToken: true };
+    runtime.busy = true;
+    try {
+      await signInInteractively(ui, {
+        baseUrl,
+        platform: process.platform,
+        showWordmark,
+        storesBlocked: async () => cookieStoresBlocked(await browserCookieStores({ homeDir: io.homeDir })),
+        openInBrowser,
+        readBrowserSession: () => getAuthenticatedSession(baseUrl, { ...auth, noCache: true, nonInteractive: true }),
+        browserLogin: onBrowserOpened => getAuthenticatedSessionWithBrowserFallback(baseUrl, { ...auth, onBrowserOpened }),
+        pasteLogin: () => pasteLogin(baseUrl, true),
+        keepaliveInstalled: async () => (await keepaliveStatus(io.homeDir)).installed,
+        installKeepalive: () => installKeepalive({ homeDir: io.homeDir }),
+      });
+    } finally {
+      runtime.busy = false;
     }
-    if (!looksLikeUrl(target)) {
-      throw new UsageError(`No such command '${target}'.`);
+  };
+
+  const choose = async <T>(action: () => Promise<T>, retry: (id: number) => Promise<T>): Promise<T> => {
+    try { return await action(); } catch (error) {
+      if (!(error instanceof ReferenceError) || error.code !== "ambiguous" || !human()) throw error;
+      const ui = createUi({ input: io.stdin ?? process.stdin, output: stderr as Writable, interactive: true });
+      const hint = (c: Candidate) => c.code ?? c.type;
+      const chosen = await ui.select(error.message, error.candidates.map(c => ({ value: c.id, label: c.name, ...(hint(c) ? { hint: hint(c) } : {}) })));
+      return await retry(chosen);
     }
-    await dispatchUrl(runtime, target, { ...parseRootOutputOptions(io.rootArgs ?? []), ...options });
+  };
+
+  program.action(async (targets: string[], options: Record<string, unknown>) => {
+    const merged = { ...parseRootOutputOptions(io.rootArgs ?? []), ...options };
+    if (!targets.length) return execute("home", { days: program.opts().days }, merged);
+    if (targets.length === 1 && looksLikeUrl(targets[0])) return dispatchUrl(runtime, targets[0], merged);
+    if (targets[0] === "unit") throw new UsageError("Unknown command 'unit'.", "Did you mean 'units'? Run moodle units.");
+    const client = await runtime.getClient();
+    const courses = await client.getCourses();
+    const service = createIntentService(createMoodleGateway(client));
+    const parsed = await choose(async () => splitUnitPhrase(targets.join(" "), courses), async id => ({ course: courses.find(c => c.id === id)!, query: targets.slice(1).join(" ") }));
+    // A bare number that is not a unit id is an activity id, as every screen prints them.
+    if (!parsed && targets.length === 1 && /^\d+$/u.test(targets[0])) return execute("item", { ref: Number(targets[0]) }, merged, service);
+    if (!parsed) {
+      // A bare target is a place to go, not a forum search: an unmatched one is an
+      // error with the site's own unit list, not an empty result and exit 0.
+      const query = targets.join(" ");
+      if (!(await service.find(query, undefined, undefined, false)).length) {
+        throw new ReferenceError("not_found", `No unit or item matches '${query}'. Your units: ${courses.map(c => c.shortname || c.fullname).join(", ")}.`, courses.map(c => ({ id: c.id, name: c.fullname || c.shortname, code: c.shortname || undefined })));
+      }
+      return execute("find", { query, limit: program.opts().limit }, merged, service);
+    }
+    const unit = parsed.course.id;
+    const query = parsed.query;
+    if (["grades", "news", "due"].includes(query)) return execute(query as Intent, { unit, ...(query !== "grades" ? { limit: program.opts().limit } : {}) }, merged, service);
+    if (query === "files") return execute("find", { query: "*", unit, types: ["resource", "folder"], limit: program.opts().limit }, merged, service);
+    if (query === "forums") { const rows = await createMoodleGateway(client).listForums({ courseId: unit }); return runtime.output({ forums: rows.map(f => ({ id: f.id, name: f.name, unit_id: f.course_id })), total: rows.length }, () => formatForumActivities(rows), merged); }
+    if (!query) {
+      let data = await service.run("unit", { unit });
+      if (outputFormat(merged, stdout) === "table") {
+        // The label, not the bare name: a nested child's own name ("Own time") repeats.
+        const current = (data.unit as { current_section?: { name: string } }).current_section;
+        if (current) data = await service.run("unit", { unit, section: current.name }).catch((error: unknown) => {
+          if (error instanceof ReferenceError) return data;
+          throw error;
+        });
+        data = { ...data, ...await service.run("due", { unit }), ...await service.run("news", { unit, limit: 1 }) };
+      }
+      return runtime.output(data, () => screen(data), merged);
+    }
+    const sections = await service.sections(unit);
+    try {
+      const namedSection = sections.some(section => normalize(section.name).includes(normalize(query)));
+      const numberedSection = /^\d+$/u.test(query) || /^\S+\s+\d+$/u.test(query);
+      if (!namedSection && !numberedSection) throw new ReferenceError("not_found", "Not a section reference.", []);
+      resolveSection(query, sections);
+      return await execute("unit", { unit, section: query }, merged, service);
+    } catch (error) { if (!(error instanceof ReferenceError)) throw error;
+      if (error.code === "ambiguous") {
+        return choose(async () => { throw error; }, async id => {
+          const chosen = sections.find(section => section.id === id)!;
+          const result = await createIntentService({ ...createMoodleGateway(client), getCourse: async () => ({ course: parsed.course, sections: [chosen] }) }).run("unit", { unit, section: chosen.name });
+          await runtime.output(result, () => screen(result), merged);
+        });
+      }
+    }
+    return choose(() => execute("item", { ref: `${parsed.course.shortname || parsed.course.fullname} ${query}` }, merged, service), id => execute("item", { ref: id }, merged, service));
   });
+
+  for (const name of ["due", "news"] as const) {
+    const command = addOutputOptions(program.command(name).description(humanDescription(name)).argument("[unit]", "Unit code, name, id or URL"));
+    if (name === "due") command.option("--days <number>", "Deadline window in days.", parsePositiveInt);
+    command
+      .option("--limit <number>", "Maximum returned rows.", parsePositiveInt)
+      .action(async (unit: string | undefined, options: OutputCommandOptions & { days?: number; limit?: number }) => execute(name, { unit, limit: count("limit", options.limit), ...(name === "due" ? { days: count("days", options.days) } : {}) }, options));
+  }
+  addOutputOptions(program.command("find").description(humanDescription("find")).argument("<query>", "Words to look for").argument("[unit]", "Unit code, name, id or URL"))
+    .option("--limit <number>", "Maximum returned rows.", parsePositiveInt)
+    .option("--types <types>", "Comma-separated activity types.")
+    .action(async (query: string, unit: string | undefined, options: OutputCommandOptions & { limit?: number; types?: string }) => execute("find", { query, unit, limit: count("limit", options.limit), types: options.types?.split(",") }, options));
+  addOutputOptions(program.command("attempt").description(humanDescription("attempt")).argument("<ref>", "Quiz attempt id or review URL"))
+    .action(async (ref: string, options: OutputCommandOptions) => execute("attempt", { attempt: ref }, options));
+  // Maintainer aid: parser work needs the real page markup, and the browser session is
+  // only readable from here. Hidden from help and the generated contract on purpose.
+  const dev = program.command("dev", { hidden: true }).description("Maintainer utilities.");
+  dev.command("fetch").description("Print a same-site page as HTML with the session; sesskey values are redacted.").argument("<url>")
+    .action(async (url: string) => {
+      const client = await runtime.getClient();
+      if (new URL(url).origin !== new URL(client.baseUrl).origin) throw new UsageError("The URL must belong to the configured Moodle site.");
+      const html = await (await client.requestAbsolute(url)).text();
+      stdout.write(`${redactSesskey(html)}\n`);
+    });
+  addOutputOptions(mutating(program.command("update").description("Update the package and redeploy the managed MCP Worker when either is behind.")))
+    .option("--check", "Report versions without installing or deploying.")
+    .option("--quiet", "Print nothing; refresh the cached version only.")
+    .action(async (options: OutputCommandOptions & { check?: boolean; quiet?: boolean }) => {
+      const updateOptions = { homeDir: io.homeDir, env: io.env, fetchImpl: io.fetchImpl };
+      if (options.quiet) { await refreshLatestVersion(updateOptions); return; }
+      const worker = await getMcpService().workerState();
+      const palette = theme();
+      const workerLine = worker === null ? [] : [`${palette.dim("Worker:")} ${palette.status(worker.behind ? "behind this package" : worker.ready ? "current" : "not ready", { current: "success", "behind this package": "warning", "not ready": "danger" })}`];
+      if (options.check) {
+        const latest = await refreshLatestVersion(updateOptions);
+        const available = isNewerVersion(latest ?? undefined, VERSION);
+        const report = { current: VERSION, latest, update_available: available, ...(worker ? { worker_behind: worker.behind, worker_ready: worker.ready } : {}) };
+        await runtime.output(report, () => [
+          `${palette.dim("moodle-cli:")} ${palette.key(VERSION)} ${available ? palette.tone("warning", `→ ${latest} available`) : latest ? palette.dim("(latest)") : palette.tone("warning", "(npm unreachable)")}`,
+          ...workerLine,
+          ...(available || worker?.behind ? ["", tryLines(["moodle update"])] : []),
+        ].join("\n"), options);
+        return;
+      }
+      if (program.opts().dryRun) {
+        const latest = await refreshLatestVersion(updateOptions);
+        const steps = [...(isNewerVersion(latest ?? undefined, VERSION) ? [`install moodle-cli ${latest}`] : []), ...(worker?.behind ? ["redeploy the Worker"] : [])];
+        await runtime.output({ planned: steps, current: VERSION, latest }, () => (steps.length ? `Would ${steps.join(", then ")}.` : "Nothing to do; everything is current."), options);
+        return;
+      }
+      const report = await runUpdate({ ...updateOptions, workerBehind: worker?.behind });
+      const stale = worker && !worker.ready && !report.deployed ? [`${palette.tone("warning", "The Worker is deployed but not answering.")} ${tryLines(["moodle mcp status"])}`] : [];
+      await runtime.output({ ...report, ...(worker ? { worker_ready: worker.ready } : {}) }, () => [palette.tone(report.ok ? (report.updated || report.deployed ? "success" : "muted") : "danger", report.note), ...stale].join("\n"), options);
+      // Automation reads the exit code, so a failed installer or deploy cannot end in 0.
+      if (!report.ok) throw new CliError("upstream", report.note);
+    });
+  addOutputOptions(mutating(program.command("submit").description(humanDescription("submit")).summary("Upload files into an assignment").argument("<ref>", "Assignment id, URL, or UNIT TASK phrase").argument("[files...]", "Local files to upload")))
+    .option("--final", "Also submit for grading. Moodle does not allow undoing this.")
+    .option("--replace", "Remove the files already in the submission first.")
+    .option("--accept-statement", "Agree to the site's submission statement when it requires one.")
+    .action(async (ref: string, files: string[], options: OutputCommandOptions & { final?: boolean; replace?: boolean; acceptStatement?: boolean }) => {
+      const interactive = human();
+      // Same rule cli-kit's confirm applies, checked before the plan touches the site or the files.
+      if (!program.opts().dryRun && !program.opts().yes && !interactive) throw new UsageError("Mutation requires --yes when stdin is not interactive.", "Run with --dry-run to see the plan first.");
+      const client = await runtime.getClient();
+      const service = createIntentService(createMoodleGateway(client));
+      const args = { files: files.map(file => resolveSubmissionPath(file, io.cwd ?? process.cwd())), final: Boolean(options.final), replace: Boolean(options.replace), accept_statement: Boolean(options.acceptStatement) };
+      // The plan reads the files and every Moodle page the upload needs, so most refusals happen before any prompt.
+      const plan = await choose(() => service.run("submit", { ref, ...args, dry_run: true }), id => service.run("submit", { ref: id, ...args, dry_run: true }));
+      const planned = submissionReceiptOf(plan.submission);
+      if (program.opts().dryRun) return runtime.output(plan, () => formatSubmissionReceipt(planned), options);
+      if (!await confirm({ summary: submissionSummary(planned, args.final, theme()) }, { yes: Boolean(program.opts().yes), dryRun: false, interactive })) return;
+      // The upload is the one long step a person watches, so it gets a spinner that names each file.
+      const spin = interactive ? createUi({ input: io.stdin ?? process.stdin, output: stderr as Writable, interactive: true }).spinner() : undefined;
+      runtime.busy = true;
+      spin?.start("Preparing the upload");
+      let result: Record<string, unknown>;
+      try {
+        const live = createIntentService(createMoodleGateway(client, { onSubmitProgress: message => spin?.message(message) }));
+        result = await live.run("submit", { ref: planned.id, ...args, dry_run: false });
+        const receipt = submissionReceiptOf(result.submission);
+        spin?.stop(receipt.uploads.length ? `Uploaded ${receipt.uploads.map(file => file.name).join(", ")} to ${receipt.name}` : `Submitted ${receipt.name}`);
+      } catch (error) {
+        spin?.error("The upload did not complete");
+        throw error;
+      } finally {
+        runtime.busy = false;
+      }
+      await runtime.output(result, () => formatSubmissionReceipt(submissionReceiptOf(result.submission)), options);
+    });
+  const quiz = program.command("quiz").description("Take a quiz: start an attempt, answer questions, finish it. Beta.").summary("Take a quiz (beta)");
+  quiz.addHelpText("after", `\n${QUIZ_NOTICE.join("\n")}\n`);
+  // Every quiz write needs an informed yes: the notice is part of the prompt, and a pipe must pass --yes.
+  const quizConsent = async (summary: string): Promise<boolean> => {
+    const palette = theme();
+    if (!program.opts().yes && !human()) throw new UsageError("Quiz actions need --yes when stdin is not interactive.", QUIZ_NOTICE.join(" "));
+    const notice = [palette.tone("warning", "BETA"), ...QUIZ_NOTICE.map(line => palette.dim(line))].join("\n");
+    return confirm({ summary: `${notice}\n\n${summary}` }, { yes: Boolean(program.opts().yes), dryRun: false, interactive: human() });
+  };
+  const attemptNext = (page: AttemptPage): string[] => {
+    const sequential = page.navigation_method === "sequential";
+    // A sequential quiz has locked its earlier pages, so their gaps are no longer the next step.
+    const open = page.navigation.find(entry => entry.number !== "i" && /not yet|not answered/iu.test(entry.state) && (!sequential || entry.page >= page.page));
+    if (!open) return [`moodle quiz finish ${page.attempt} ${page.quiz_id}`];
+    if (open.page === page.page) return [`moodle quiz answer ${page.attempt} ${page.quiz_id} ${open.number} <answer>`];
+    return [`moodle quiz show ${page.attempt} ${page.quiz_id} --page ${sequential ? page.page + 2 : open.page + 1}`];
+  };
+  const showPage = (page: AttemptPage, palette: Theme) => `${palette.tone("warning", "BETA")} ${formatAttemptPage(page)}\n\n${tryLines(attemptNext(page))}`;
+  addOutputOptions(mutating(quiz.command("start").description("Start a new attempt, or continue the one in progress, and show its first page.").argument("<ref>", "Quiz id, URL, or UNIT TASK phrase")))
+    .option("--password <password>", "Quiz access password for scripts; at a terminal you are asked for it instead.")
+    .action(async (ref: string, options: OutputCommandOptions & { password?: string }) => {
+      const client = await runtime.getClient();
+      const service = createIntentService(createMoodleGateway(client));
+      const id = await choose(() => service.resolveItem(ref), id => Promise.resolve(id));
+      // Read the quiz first: the consent has to name the time limit and the attempt it uses,
+      // because the start below clicks through Moodle's own pre-flight confirmation.
+      const plan = await client.planQuizStart(id);
+      if (program.opts().dryRun) return runtime.output({ planned: plan }, () => quizStartSummary(plan, theme()), options);
+      if (!await quizConsent(quizStartSummary(plan, theme()))) return;
+      // The password is only asked for when Moodle's pre-flight form wants one, so most quizzes never see a prompt.
+      const password = async (): Promise<string | null> => {
+        if (options.password) return options.password;
+        const input = io.stdin ?? process.stdin;
+        if (!human() || !input.isTTY) return null;
+        return readSecretLine(input, stderr as NodeJS.WritableStream, "Quiz password (not echoed): ");
+      };
+      const page = await client.startQuizAttempt(id, { password });
+      await runtime.output({ attempt: page }, () => showPage(page, theme()), options);
+    });
+  addOutputOptions(quiz.command("show").description("Show one page of an attempt in progress: questions, options and saved answers.").argument("<attempt>", "Attempt id").argument("<quiz>", "Quiz id"))
+    .option("--page <n>", "Page number, starting at 1.", parsePositiveInt)
+    .action(async (attempt: string, quizId: string, options: OutputCommandOptions & { page?: number }) => {
+      const client = await runtime.getClient();
+      const ids = [parsePositiveInt(attempt), parsePositiveInt(quizId)] as const;
+      let page = await client.getQuizAttemptPage(...ids);
+      const wanted = options.page === undefined ? page.page : options.page - 1;
+      if (wanted !== page.page) {
+        // In a sequential quiz, opening the next page is a write: the current page locks for good.
+        const advance = page.navigation_method === "sequential" && wanted === page.page + 1;
+        const lock = `Open page ${wanted + 1}. This quiz moves forward only: page ${page.page + 1} locks and you cannot go back to it.`;
+        if (advance && program.opts().dryRun) return runtime.output({ planned: "advance", attempt: ids[0], quiz_id: ids[1], page: wanted + 1 }, () => `Would ${lock.charAt(0).toLowerCase()}${lock.slice(1)}`, options);
+        if (advance && !await quizConsent(theme().tone("warning", lock))) return;
+        page = await client.getQuizAttemptPage(...ids, wanted, { advance });
+      }
+      await runtime.output({ attempt: page }, () => showPage(page, theme()), options);
+    });
+  addOutputOptions(mutating(quiz.command("answer").description("Save one answer: option letters for a choice question (b, or a,c), the text otherwise.").argument("<attempt>", "Attempt id").argument("<quiz>", "Quiz id").argument("<question>", "Question number as shown").argument("[answer]", "Option letters or answer text")))
+    .option("--from <file>", "Read the answer text from a file.")
+    .action(async (attempt: string, quizId: string, question: string, answer: string | undefined, options: OutputCommandOptions & { from?: string }) => {
+      const value = options.from ? await readFile(path.resolve(io.cwd ?? process.cwd(), options.from), "utf8") : answer;
+      if (!value?.trim()) throw new UsageError("Give the answer as an argument or with --from <file>.");
+      const request = { attemptId: parsePositiveInt(attempt), quizId: parsePositiveInt(quizId), question, value };
+      const palette = theme();
+      const preview = value.trim().length > 80 ? `${value.trim().slice(0, 77)}...` : value.trim();
+      if (program.opts().dryRun) return runtime.output({ planned: "answer", ...request }, () => `Would answer question ${question} of attempt ${attempt} with: ${preview}`, options);
+      if (!await quizConsent(`Save ${palette.subject(preview)} as the answer to question ${palette.target(question)} of attempt ${attempt}.`)) return;
+      const client = await runtime.getClient();
+      const page = await client.answerQuizQuestion(request);
+      await runtime.output({ attempt: page }, () => showPage(page, palette), options);
+    });
+  addOutputOptions(mutating(quiz.command("finish").description("Submit the attempt for grading. Moodle does not allow undoing this.").argument("<attempt>", "Attempt id").argument("<quiz>", "Quiz id")))
+    .action(async (attempt: string, quizId: string, options: OutputCommandOptions) => {
+      const client = await runtime.getClient();
+      const ids = [parsePositiveInt(attempt), parsePositiveInt(quizId)] as const;
+      const summary = await client.getQuizAttemptSummary(...ids);
+      if (program.opts().dryRun) return runtime.output({ planned: "finish", summary }, () => formatAttemptSummary(summary), options);
+      const palette = theme();
+      const open = summary.rows.filter(row => /not yet answered/iu.test(row.state));
+      const warning = open.length ? `\n${palette.tone("danger", `${open.length} question${open.length === 1 ? "" : "s"} not yet answered: ${open.map(row => row.number).join(", ")}`)}` : "";
+      if (!await quizConsent(`${formatAttemptSummary(summary)}${warning}\n${palette.tone("warning", "Submit all and finish. Moodle does not allow undoing this.")}`)) return;
+      const receipt = await client.finishQuizAttempt(...ids);
+      await runtime.output({ finished: receipt }, () => formatAttemptFinish(receipt), options);
+    });
+  addOutputOptions(program.command("open").description("Open a unit or activity reference in the browser.").argument("<ref>", "Unit or activity id, URL, or UNIT TASK phrase"))
+    .action(async (ref: string, options: OutputCommandOptions) => {
+      const client = await runtime.getClient();
+      let url: string;
+      if (looksLikeUrl(ref)) { await resolveTopLevelUrl(client.baseUrl, ref); url = ref; }
+      else {
+        const parsed = splitUnitPhrase(ref, await client.getCourses());
+        if (parsed && !parsed.query) url = `${client.baseUrl}/course/view.php?id=${parsed.course.id}`;
+        else { const id = await createIntentService(createMoodleGateway(client)).resolveItem(ref); const item = await client.getActivity(id); url = item.url; }
+      }
+      if (!url || !/^https?:/u.test(url)) throw new UsageError("This item has no browser URL.");
+      await openInBrowser(url);
+      await runtime.output({ opened: url }, () => `Opened ${url}`, options);
+    });
 
   addOutputOptions(program.command("user").description("Show authenticated user info.")).action(async (options: OutputCommandOptions) => {
     const user = await (await runtime.getClient()).getSiteInfo();
-    runtime.output(user, () => formatUser(user), options);
+    await runtime.output({ user: { id: user.userid, name: user.fullname, siteurl: user.siteurl, timezone: user.timezone } }, () => formatUser(user), options);
   });
 
-  addOutputOptions(program.command("courses").description("List enrolled courses.")).action(async (options: OutputCommandOptions) => {
-    const courses = await (await runtime.getClient()).getCourses();
-    runtime.output(courses, () => formatCourses(courses), options);
+  const units = program.command("units").aliases(["courses"]).description("Inspect enrolled units.");
+  addOutputOptions(units.command("list").description("List enrolled units.")).action(async (options: OutputCommandOptions) => {
+    await execute("units", {}, options);
   });
+
+  addOutputOptions(units.command("show").description("Show unit detail with sections.").argument("<unit>", "Unit ID or unique name")).action(
+    async (unit: string, options: OutputCommandOptions) => {
+      const client = await runtime.getClient();
+      const courseId = await client.resolveCourseReference(unit);
+      await execute("unit", { unit: courseId }, options);
+    },
+  );
 
   addOutputOptions(program.command("todo").description("List upcoming actionable timeline items."))
     .option("--limit <number>", "Maximum number of items.", parsePositiveInt, 20)
     .option("--days <number>", "Only include items due within the next N days.", parsePositiveInt)
     .action(async (options: OutputCommandOptions & { limit: number; days?: number }) => {
-      const items = await (await runtime.getClient()).getTodo(options.limit, options.days);
-      runtime.output(items, () => formatTodo(items), options);
+      await execute("due", { limit: count("limit", options.limit), days: count("days", options.days) }, options);
     });
 
   addOutputOptions(program.command("alerts").description("List notifications and message counts."))
     .option("--limit <number>", "Maximum number of notifications.", parsePositiveInt, 20)
-    .option("--mark-read", "Mark all notifications as read after listing.")
-    .action(async (options: OutputCommandOptions & { limit: number; markRead?: boolean }) => {
-      const client = await runtime.getClient();
-      const alerts = await client.getAlerts(options.limit);
-      if (options.markRead) {
-        await client.markAllNotificationsRead();
-      }
-      const data = options.markRead ? { ...alerts, marked_read: true } : alerts;
-      runtime.output(data, () => `${formatAlerts(alerts)}${options.markRead ? "\nMarked all notifications as read" : ""}`, options);
+    .action(async (options: OutputCommandOptions & { limit: number }) => {
+      const alerts = await (await runtime.getClient()).getAlerts(count("limit", options.limit)!);
+      await runtime.output(stripEmpty({ alerts }), () => formatAlerts(alerts), options);
     });
 
   addOutputOptions(program.command("overview").description("Show a compact multi-source overview."))
@@ -172,193 +588,94 @@ export function buildProgram(io: CliIO = {}): Command {
     .option("--todo-days <number>", "Only include todo items due within the next N days.", parsePositiveInt)
     .option("--alerts-limit <number>", "Maximum number of notifications.", parsePositiveInt, 5)
     .action(async (options: OutputCommandOptions & { todoLimit: number; todoDays?: number; alertsLimit: number }) => {
-      const overview = await (await runtime.getClient()).getOverview(options.todoLimit, options.todoDays, options.alertsLimit);
-      runtime.output(overview, () => `${formatUser(overview.user)}\n\n${formatTodo(overview.todo)}\n\n${overview.alerts ? formatAlerts(overview.alerts) : ""}`, options);
+      await execute("home", { days: options.todoDays }, options);
     });
 
-  addCourseCommand(program, runtime, "course", "Show course detail with sections.", async (client, courseId) => client.getCourseContents(courseId), formatCourseSections);
-  addCourseCommand(program, runtime, "activities", "List activities in a course.", async (client, courseId) => client.getActivities(courseId), formatActivityList);
-
-  addOutputOptions(program.command("grades").description("Show grade details for a course, or an all-course overview.").argument("[course]", "Course ID or unique name; omit for an overview of all courses")).action(
-    async (course: string | undefined, options: OutputCommandOptions) => {
+  const activities = program.command("activities").description("Inspect activities.");
+  addOutputOptions(activities.command("list").description("List activities in a unit; narrow by section.").argument("<unit>", "Unit code, name, id or URL"))
+    .option("--section <section>", "Section number or name.")
+    .option("--limit <number>", "Maximum returned activities.", parsePositiveInt, 200)
+    .option("--include-labels", "Include inline labels.")
+    .action(async (unit: string, options: OutputCommandOptions & { section?: string; limit: number; includeLabels?: boolean }) => {
       const client = await runtime.getClient();
-      if (!course) {
-        const overview = await client.getGradesOverview();
-        runtime.output(overview, () => formatGradesOverview(overview), options);
-        return;
-      }
-      const courseId = await client.resolveCourseReference(course);
-      const grades = await client.getCourseGrades(courseId);
-      runtime.output(grades, () => formatGrades(grades), options);
+      const courseId = await client.resolveCourseReference(unit);
+      const sections = await client.getCourseContents(courseId);
+      const chosen = options.section ? withChildSections(resolveSection(options.section, sections).section, sections) : sections;
+      const rows = chosen.flatMap(section => section.activities.filter(a => options.includeLabels || a.modname !== "label").map(a => activitySchema.parse(stripEmpty(activityRow(a, section)))));
+      const result = stripEmpty({ activities: rows.slice(0, count("limit", options.limit)), total: rows.length }) as Record<string, unknown>;
+      await runtime.output(result, () => runtime.screen(result, options), options);
+    });
+  addOutputOptions(activities.command("show").description("Show activity details, including the files moodle download would save.").summary("Show activity details").argument("<id>", "Course-module ID")).action(
+    async (id: string, options: OutputCommandOptions) => {
+      await execute("item", { ref: parsePositiveInt(id) }, options);
     },
   );
 
-  addOutputOptions(program.command("messages").description("List message conversations, or show one conversation.").argument("[conversation]", "Conversation ID"))
-    .option("--limit <number>", "Maximum number of conversations or messages.", parsePositiveInt, 20)
-    .action(async (conversation: string | undefined, options: OutputCommandOptions & { limit: number }) => {
-      const client = await runtime.getClient();
-      if (conversation) {
-        const detail = await client.getConversationMessages(parsePositiveInt(conversation), options.limit);
-        runtime.output(detail, () => formatConversationDetail(detail), options);
-        return;
-      }
-      const conversations = await client.getConversations(options.limit);
-      runtime.output(conversations, () => formatConversations(conversations), options);
-    });
-
-  addOutputOptions(program.command("download").description("Download resources, folders, Pages with attachments, a course week, or a whole course.").argument("[target]", "Resource/Page module ID or URL, folder URL, direct file URL, or course code when WEEK is provided").argument("[week]", "Course section/week number"))
-    .option("--course <course>", "Download all resource, folder, and Page content in a course.")
-    .option("--dir <dir>", "Destination directory.", ".")
-    .option("--force", "Overwrite existing files.")
-    .option("--dry-run", "List what would be downloaded without downloading.")
-    .action(async (target: string | undefined, week: string | undefined, options: OutputCommandOptions & { course?: string; dir: string; force?: boolean; dryRun?: boolean }) => {
-      const client = await runtime.getClient();
-      if (week !== undefined && options.course) {
-        throw new UsageError("Use either COURSE WEEK positional arguments or --course, not both.");
-      }
-      if (target !== undefined && options.course) {
-        throw new UsageError("Do not provide a target together with --course.");
-      }
-      const sectionNumber = week === undefined ? undefined : parsePositiveInt(week);
-      const courseId = sectionNumber !== undefined
-        ? await client.resolveCourseReference(target ?? "")
-        : options.course
-          ? await client.resolveCourseReference(options.course)
-          : undefined;
-      const plans = await planDownloads(client, sectionNumber === undefined ? target : undefined, courseId, sectionNumber);
-      const results = await executeDownloads(client, plans, { dir: options.dir, force: options.force, dryRun: options.dryRun });
-      runtime.output(results, () => formatDownloadResults(results), options);
-    });
-
-  addOutputOptions(program.command("calendar").description("Show calendar events (upcoming by default)."))
-    .option("--month <month>", "Show a specific month as YYYY-MM.")
-    .option("--course <course>", "Restrict to a course ID or unique course name match.")
-    .option("--ics <file>", "Also write the events to an ICS calendar file.")
-    .action(async (options: OutputCommandOptions & { month?: string; course?: string; ics?: string }) => {
-      const client = await runtime.getClient();
-      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
-      let events;
-      if (options.month) {
-        const match = options.month.match(/^(\d{4})-(\d{1,2})$/);
-        if (!match || Number(match[2]) < 1 || Number(match[2]) > 12) {
-          throw new UsageError("--month expects YYYY-MM.");
-        }
-        events = await client.getCalendarMonth(Number(match[1]), Number(match[2]), courseId);
-      } else {
-        events = await client.getCalendarUpcoming(courseId);
-      }
-      if (options.ics) {
-        await writeFile(options.ics, eventsToIcs(events));
-      }
-      runtime.output(events, () => `${formatCalendarEvents(events)}${options.ics ? `\nWrote ${events.length} events to ${options.ics}` : ""}`, options);
-    });
-
-  addOutputOptions(program.command("search").description("Search activity and section names/descriptions across courses.").argument("<query>", "Search query"))
-    .option("--course <course>", "Restrict to a course ID or unique course name match.")
-    .option("--limit <number>", "Maximum number of matches.", parsePositiveInt, 20)
-    .action(async (query: string, options: OutputCommandOptions & { course?: string; limit: number }) => {
-      const client = await runtime.getClient();
-      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
-      const hits = await searchCourseContent(client, query, { courseId, limit: options.limit });
-      runtime.output(hits, () => formatCourseSearchHits(hits), options);
-    });
-
-  addOutputOptions(program.command("export").description("Export course pages, links, and files to a local directory.").argument("<course>", "Course ID or unique name"))
-    .option("--dir <dir>", "Destination directory.", ".")
-    .option("--force", "Overwrite existing files.")
-    .action(async (course: string, options: OutputCommandOptions & { dir: string; force?: boolean }) => {
-      const client = await runtime.getClient();
-      const courseId = await client.resolveCourseReference(course);
-      const summary = await exportCourse(client, courseId, { dir: options.dir, force: options.force });
-      runtime.output(summary, () => formatCourseExport(summary), options);
-    });
-
-  addActivityCommand(program, runtime, "assign", "Assignment", ASSIGN_VIEW_PATH, (client, id) => client.getAssignment(id));
-  addActivityCommand(program, runtime, "quiz", "Quiz", QUIZ_VIEW_PATH, (client, id) => client.getQuiz(id));
-  addActivityCommand(program, runtime, "resource", "Resource", RESOURCE_VIEW_PATH, (client, id) => client.getResource(id));
-  addActivityCommand(program, runtime, "link", "Link", URL_VIEW_PATH, (client, id) => client.getLink(id));
-  addActivityCommand(program, runtime, "page", "Page", PAGE_VIEW_PATH, (client, id) => client.getPage(id));
-  addActivityCommand(program, runtime, "folder", "Folder", FOLDER_VIEW_PATH, (client, id) => client.getFolder(id));
-
   addOutputOptions(
     program
-      .command("submit")
-      .description("Upload files to an assignment submission (saves the submission; add --submit to lock it in for grading).")
-      .argument("<assign>", "Assignment ID or URL")
-      .argument("<files...>", "Files to upload"),
-  )
-    .option("--submit", "Also submit for grading. This locks the submission and cannot be undone.")
-    .option("--confirm", "Required with --submit to confirm the lock step.")
-    .action(async (assign: string, files: string[], options: OutputCommandOptions & { submit?: boolean; confirm?: boolean }) => {
-      if (options.submit && !options.confirm) {
-        throw new UsageError("--submit permanently locks the submission for grading. Add --confirm to proceed.");
-      }
-      const id = parseActivityReference(assign, "Assignment", ASSIGN_VIEW_PATH);
-      const client = await runtime.getClient();
-      const result = await submitAssignment(client, id, files, { finalize: Boolean(options.submit && options.confirm) });
-      runtime.output(result, () => formatAssignSubmitResult(result), options);
-    });
+      .command("download")
+      .aliases(["dl", "get"])
+      .description("Download files: one activity, a whole section, or a file URL. With no argument, browse.")
+      .argument("[ref...]", "Activity id, same-site activity/section/file URL, or UNIT TASK phrase")
+      .option("--to <directory>", "Destination directory; created when missing.")
+      .option("--dest <path>", "Exact path for a single downloaded file.")
+      .option("--force", "Atomically replace existing files."),
+  ).action(async (ref: string[], options: OutputCommandOptions & { to?: string; dest?: string; force?: boolean }) => {
+    const cwd = io.cwd ?? process.cwd();
+    const client = await runtime.getClient();
+    const service = createIntentService(createMoodleGateway(client));
+    const ui = human() ? createUi({ input: io.stdin ?? process.stdin, output: stderr as Writable, interactive: true }) : undefined;
+    const source = await chooseDownloadSource(client, service, ref.join(" "), ui);
+    // Ctrl+C mid-file must remove the partial temp file, so the first one aborts cleanly
+    // and a second one falls back to the default exit.
+    const abort = new AbortController();
+    const onInterrupt = () => abort.abort();
+    process.once("SIGINT", onInterrupt);
+    const spin = ui?.spinner();
+    spin?.start("Finding files");
+    // The spinner already says Moodle is busy; the request indicator would draw into it,
+    // and into the cancel message while lookups started before Ctrl+C wind down.
+    runtime.busy = Boolean(spin);
+    try {
+      const result = await downloadMoodleFiles(client, {
+        source,
+        destination: options.dest ? path.resolve(cwd, options.dest) : undefined,
+        directory: options.to ? path.resolve(cwd, options.to) : undefined,
+        force: options.force,
+        dryRun: Boolean(program.opts().dryRun),
+        onFile: (index, total, name) => spin?.message(total > 1 ? `Downloading ${index}/${total}${name ? ` · ${name}` : ""}` : `Downloading${name ? ` ${name}` : ""}`),
+      }, abort.signal);
+      spin?.clear();
+      await runtime.output(result, () => formatDownloadResult(result, cwd), options, false);
+    } catch (error) {
+      spin?.clear();
+      throw error;
+    } finally {
+      process.off("SIGINT", onInterrupt);
+    }
+  });
 
-  addOutputOptions(program.command("choice").description("Show a choice activity, or vote with --answer.").argument("<choice>", "Choice ID or URL"))
-    .option("--answer <option...>", "Option ID(s) to vote for (see the listed option IDs).")
-    .action(async (choice: string, options: OutputCommandOptions & { answer?: string[] }) => {
-      const id = parseActivityReference(choice, "Choice", CHOICE_VIEW_PATH);
-      const client = await runtime.getClient();
-      if (!options.answer?.length) {
-        const info = await getChoice(client, id);
-        runtime.output(info, () => formatChoice(info), options);
-        return;
-      }
-      const answers = options.answer.map((value) => parsePositiveInt(value));
-      const info = await voteChoice(client, id, answers);
-      runtime.output(info, () => `Vote saved\n${formatChoice(info)}`, options);
-    });
+  const grades = program.command("grades").description("Inspect grades.");
+  addOutputOptions(grades.command("list").description("Show grade details for a unit.").argument("[unit]", "Unit code, name, id or URL").option("--graded-only", "Only return graded items.")).action(
+    async (unit: string | undefined, options: OutputCommandOptions & { gradedOnly?: boolean }) => execute("grades", { unit, graded_only: options.gradedOnly }, options),
+  );
 
-  addOutputOptions(program.command("feedback").description("List feedback questions, or fill it in with --answer.").argument("<feedback>", "Feedback ID or URL"))
-    .option("--answer <pair...>", "Answers as <questionId>=<value> (repeatable).")
-    .action(async (feedback: string, options: OutputCommandOptions & { answer?: string[] }) => {
-      const id = parseActivityReference(feedback, "Feedback", FEEDBACK_VIEW_PATH);
-      const client = await runtime.getClient();
-      if (!options.answer?.length) {
-        const info = await getFeedback(client, id);
-        runtime.output(info, () => formatFeedbackInfo(info), options);
-        return;
-      }
-      const answers: Record<number, string> = {};
-      for (const pair of options.answer) {
-        const match = pair.match(/^(\d+)=([\s\S]*)$/);
-        if (!match) {
-          throw new UsageError(`--answer expects <questionId>=<value>, got '${pair}'.`);
-        }
-        answers[Number(match[1])] = match[2];
-      }
-      const result = await completeFeedback(client, id, answers);
-      runtime.output(result, () => formatFeedbackResult(result), options);
-    });
-
-  addOutputOptions(program.command("complete").description("Manually mark an activity as complete.").argument("<activity>", "Activity (course module) ID or URL"))
-    .option("--undo", "Mark as not complete instead.")
-    .action(async (activity: string, options: OutputCommandOptions & { undo?: boolean }) => {
-      const cmid = parseCmidReference(activity);
-      const client = await runtime.getClient();
-      const completed = !options.undo;
-      const updated = await client.markActivityCompletion(cmid, completed);
-      const result = { cmid, completed, updated };
-      runtime.output(result, () => formatCompletionResult(result), options);
-    });
-
-  const forum = program.command("forum").description("Forum utilities.");
-  addOutputOptions(forum.command("discussion").description("Show posts in a forum discussion.").argument("<discussion>", "Discussion ID or URL"))
+  const threads = program.command("threads").description("Inspect forum discussion threads.");
+  addOutputOptions(threads.command("show").description("Show posts in a forum discussion.").argument("<discussion>", "Discussion ID or URL"))
+    .option("--limit <number>", "Maximum returned posts.", parsePositiveInt)
+    .option("--offset <number>", "Skip this many posts.", value => { const n = Number(value); if (!Number.isInteger(n) || n < 0) throw new UsageError("Expected a nonnegative offset."); return n; }, 0)
     .option("--post <id>", "Show a specific post ID.", parsePositiveInt)
     .option("--body", "Show full post body.")
-    .action(async (discussion: string, options: OutputCommandOptions & { post?: number; body?: boolean }) => {
+    .action(async (discussion: string, options: OutputCommandOptions & { post?: number; body?: boolean; limit?: number; offset?: number }) => {
       const parsed = parseDiscussionReference(discussion);
       const postId = options.post ?? parsed.postId;
       const thread = filterDiscussionToPost(await (await runtime.getClient()).getForumDiscussion(parsed.discussionId), postId);
-      runtime.output(thread, () => formatForumDiscussion(thread, { showBody: options.body }), options);
+      if (postId) await runtime.output(stripEmpty({ thread: { id: thread.id, name: thread.subject, unit_id: thread.course_id, forum_id: thread.forum_id, url: thread.url, posts: thread.posts.map(p => postRow(p, thread.subject)), posts_total: thread.posts.length, offset: 0 } }), () => formatForumDiscussion(thread, { showBody: options.body }), options);
+      else await execute("thread", { discussion_id: parsed.discussionId, limit: count("limit", options.limit), offset: options.offset }, options);
     });
 
-  addOutputOptions(forum.command("discussions").description("List discussions from a forum.").argument("<forum>", "Forum ID or URL"))
+  const forums = program.command("forums").description("Inspect forums.");
+  addOutputOptions(forums.command("show").description("List discussions from a forum.").argument("<forum>", "Forum ID or URL"))
     .option("--limit <number>", "Maximum number of discussions.", parsePositiveInt, 50)
     .option("--query <query>", "Filter discussion titles by query.")
     .action(async (forumRef: string, options: OutputCommandOptions & { limit: number; query?: string }) => {
@@ -368,34 +685,59 @@ export function buildProgram(io: CliIO = {}): Command {
       if (options.query) {
         refs = refs.filter((ref) => queryMatches(ref.subject, options.query!));
       }
-      refs = refs.slice(0, options.limit);
-      runtime.output(refs, () => formatForumDiscussionRefs(forumId, refs), options);
+      const total = refs.length;
+      refs = refs.slice(0, count("limit", options.limit));
+      await runtime.output(stripEmpty({ threads: refs.map(t => ({ id: t.id, name: t.subject })), total }), () => formatForumDiscussionRefs(forumId, refs), options);
     });
 
-  addOutputOptions(forum.command("forums").description("List forum activities.").argument("[query]", "Optional forum/course query"))
-    .option("--course <course>", "Restrict to a course ID or unique course name match.")
+  addOutputOptions(forums.command("list").description("List forum activities in a unit.").argument("<unit>", "Unit ID or unique name"))
     .option("--limit <number>", "Maximum number of forums.", parsePositiveInt, 50)
-    .action(async (query: string | undefined, options: OutputCommandOptions & { course?: string; limit: number }) => {
+    .action(async (unit: string, options: OutputCommandOptions & { limit: number }) => {
       const client = await runtime.getClient();
-      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
+      const courseId = await client.resolveCourseReference(unit);
       let forums = await client.getForums(courseId);
-      if (query) {
-        forums = forums.filter((forum) => queryMatches(forum.name, query) || queryMatches(forum.course_name, query));
-      }
-      forums = forums.slice(0, options.limit);
-      runtime.output(forums, () => formatForumActivities(forums), options);
+      const total = forums.length;
+      forums = forums.slice(0, count("limit", options.limit));
+      await runtime.output(stripEmpty({ forums: forums.map(f => ({ id: f.id, name: f.name, unit_id: f.course_id })), total }), () => formatForumActivities(forums), options);
     });
 
-  addForumSearchCommand(forum.command("search").description("Search forum discussion titles and post text."), runtime, 20, false);
-  addForumSearchCommand(forum.command("find").description("Find the best forum match.").option("--list", "Return a shortlist.").option("--body", "Resolve the target body."), runtime, 5, true);
+  addForumSearchCommand(forums.command("search").description("Search forum discussion titles and post text."), runtime, 20);
 
-  addOutputOptions(forum.command("check").description("Validate discussion rendering.").argument("<forum>", "Forum ID or URL"))
-    .option("--limit <number>", "Maximum number of discussions.", parsePositiveInt, 20)
-    .action(async (forumRef: string, options: OutputCommandOptions & { limit: number }) => {
-      const client = await runtime.getClient();
-      const forumId = await parseForumReference(forumRef, (discussionId) => client.getForumViewCmid(discussionId));
-      const results = await checkForumDiscussions(client, forumId, options.limit);
-      runtime.output(results, () => formatForumCheckResults(forumId, results), options);
+  addOutputOptions(program.command("doctor").description("Diagnose runtime, browser access, session, background jobs and MCP setup.").summary("Diagnose runtime, session and MCP setup")).action(async (options: OutputCommandOptions) => {
+    const result = await doctor(io);
+    await runtime.output(result, () => result.checks.map(c => `${c.status.toUpperCase()} ${c.name}: ${c.detail}${c.hint ? `\n  ${c.hint}` : ""}`).join("\n") + `\n\n${tryLines(doctorNextSteps(result.checks))}`, options);
+    // A health check that always succeeds cannot be scripted against.
+    if (result.checks.some(c => c.status === "fail")) process.exitCode = 3;
+  });
+  program.command("completion").description("Print shell completion for zsh, bash or fish.").addArgument(program.createArgument("<shell>", "Shell to target").choices(["zsh", "bash", "fish"])).action((shell: string) => {
+    const names = program.commands.filter(c => c.name() !== "help").flatMap(c => [c.name(), ...c.aliases()]);
+    if (shell === "bash") stdout.write(`complete -W '${names.join(" ")}' moodle\n`);
+    else if (shell === "zsh") stdout.write(`#compdef moodle\n_arguments '1:command:(${names.join(" ")})' '*:reference:'\n`);
+    else if (shell === "fish") stdout.write(names.map(n => `complete -c moodle -f -a '${n}'`).join("\n") + "\n");
+    else throw new UsageError("Choose zsh, bash or fish.");
+  });
+  addOutputOptions(mutating(program.command("uninstall").description("Remove local background jobs; optionally remove the selected Worker and configuration.").summary("Remove background jobs, Worker and config")))
+    .option("--remote", "Also remove the configured managed MCP deployment.")
+    .option("--purge", "Also delete local Moodle CLI configuration, receipts and cache.")
+    .action(async (options: OutputCommandOptions & { remote?: boolean; purge?: boolean }) => {
+      const home = io.homeDir ?? homedir();
+      const jobs = await ownedJobs(home);
+      const receipts = await readdir(path.join(home, ".config", "moodle-cli", "mcp", "deployments")).catch(() => [] as string[]);
+      const result = { jobs: jobs.map(j => j.path), remote: Boolean(options.remote), purge: Boolean(options.purge), config: path.join(home, CONFIG_DIR_NAME), cache: path.join(home, CACHE_DIR_NAME), package_command: "npm rm -g moodle-cli (or bun remove -g moodle-cli); for the standalone install: rm ~/.local/bin/moodle", remaining: options.remote ? "Only the configured Worker is removed. Other profiles remain remote." : "Remote Workers and credentials remain unless removed with moodle mcp remove." };
+      if (program.opts().dryRun) return runtime.output(result, () => JSON.stringify(result, null, 2), options);
+      if (options.purge && receipts.length && !options.remote) throw new UsageError("Managed deployment receipts exist; remove the Worker before purging its recovery information.", "Run moodle mcp remove for each configured site, then moodle uninstall --purge.");
+      if (options.purge && receipts.length > 1) throw new UsageError("Multiple managed deployment receipts exist; remove each Worker before purging configuration.");
+      if (!await confirm({ summary: `Remove Moodle background jobs${options.remote ? ", the configured Worker" : ""}${options.purge ? ", configuration and cache" : ""}.` }, { yes: Boolean(program.opts().yes), dryRun: false, interactive: human() })) return;
+      if (options.remote) await getMcpService().remove({ yes: true });
+      if (process.platform === "darwin") await uninstallKeepalive({ homeDir: home });
+      const renewal = new DefaultRenewalIntegration({ homeDirectory: home, executable: process.execPath });
+      const profiles = new Set([...jobs.map(j => j.profile), ...receipts.map(n => n.replace(/\.json$/u, ""))].filter((p): p is string => Boolean(p) && /^[a-z0-9_-]+$/u.test(p!)));
+      for (const profile of profiles) {
+        await renewal.remove(profile);
+        if (options.purge) await rm(path.join(home, "Library", "Logs", `com.moodle-cli.mcp-renewal.${profile}.log`), { force: true });
+      }
+      if (options.purge) { await rm(result.config, { recursive: true, force: true }); await rm(result.cache, { recursive: true, force: true }); }
+      await runtime.output(result, () => `Moodle background jobs removed.\n${result.remaining}\n${result.package_command}`, options);
     });
 
   const auth = program.command("auth").description("Session and keepalive utilities.");
@@ -404,81 +746,222 @@ export function buildProgram(io: CliIO = {}): Command {
     async (options: OutputCommandOptions) => {
       const baseUrl = await runtime.baseUrl();
       const status = await getAuthStatus(baseUrl, { homeDir: io.homeDir, fetchImpl: io.fetchImpl });
-      runtime.output(status, () => formatAuthStatus(status), options);
+      const cookieSqlite = runtimeSupportsCookies();
+      const note = `Runtime: ${process.versions.bun ? "bun" : "node"} ${process.versions.bun ?? process.versions.node}; ${cookieSqlite ? "SQLite cookie support available" : "needs Node 22.13+ or Bun for browser SQLite"}. Run moodle doctor.`;
+      await runtime.output({ ...status, runtime: note }, () => `${formatAuthStatus(status)}\n${note}`, options);
     },
   );
 
-  addOutputOptions(auth.command("login").description("Force a fresh login and refresh the session cache.")).action(
-    async (options: OutputCommandOptions) => {
+  addOutputOptions(
+    auth
+      .command("login")
+      .description("Sign in through a browser the CLI controls, then capture the session.")
+      .option("--paste", "Take the MoodleSession cookie from a prompt instead of the browser store."),
+  ).action(
+    async (options: OutputCommandOptions & { paste?: boolean }) => {
       const baseUrl = await runtime.baseUrl();
-      await invalidateCachedSession(baseUrl, { homeDir: io.homeDir });
-      const session = await getAuthenticatedSession(baseUrl, { env: io.env, fetch: io.fetchImpl, homeDir: io.homeDir, noCache: true });
+      const humanOutput = outputFormat(options, stdout) === "table";
+      const session = options.paste
+        ? await pasteLogin(baseUrl, humanOutput)
+        : await getAuthenticatedSessionWithBrowserFallback(baseUrl, {
+          env: io.env,
+          fetch: io.fetchImpl,
+          homeDir: io.homeDir,
+          captureMobileToken: true,
+          onBrowserOpened: humanOutput
+            ? () => stderr.write("A browser window opened. Sign in there; I'll capture the session automatically.\n")
+            : undefined,
+        });
       const result = { base_url: baseUrl, userid: session.userid, cookie_source: session.cookie.source ?? "unknown" };
-      runtime.output(result, () => `Authenticated as userid ${result.userid} via ${result.cookie_source}`, options);
+      await runtime.output(result, () => `Authenticated as userid ${result.userid} via ${result.cookie_source}`, options);
     },
   );
+
+  async function pasteLogin(baseUrl: string, humanOutput: boolean) {
+    const input = io.stdin ?? process.stdin;
+    if (humanOutput && input.isTTY) {
+      stderr.write(`Copy the ${MOODLE_SESSION_COOKIE_PREFIX} cookie for ${baseUrl} from your browser's developer tools.\nThe value is not echoed and is stored in the encrypted session cache.\n`);
+    }
+    const raw = await readSecretLine(input, stderr as NodeJS.WritableStream, input.isTTY ? `${MOODLE_SESSION_COOKIE_PREFIX}: ` : "");
+    if (raw === null) {
+      throw new CliError("cancelled", "Login cancelled.");
+    }
+    return authenticateWithPastedCookie(baseUrl, raw, { env: io.env, fetch: io.fetchImpl, homeDir: io.homeDir, captureMobileToken: true });
+  }
 
   const keepalive = addOutputOptions(
     auth
       .command("keepalive")
-      .description("Renew the Moodle session once; used by the background keepalive agent.")
+      .description("Renew the Moodle session once; used by the background keepalive agent.").summary("Renew the session once")
       .option("--no-renew", "Only touch the session; skip re-login when it is expired."),
   ).action(async (options: OutputCommandOptions & { renew: boolean }) => {
     const baseUrl = await runtime.baseUrl();
     const result = await keepAliveOnce(baseUrl, { homeDir: io.homeDir, fetchImpl: io.fetchImpl, renewOnExpiry: options.renew });
-    runtime.output(result, () => formatKeepaliveResult(result), options);
+    await runtime.output(result, () => formatKeepaliveResult(result), options);
   });
 
   addOutputOptions(
-    keepalive
+    mutating(keepalive
       .command("install")
       .description("Install a macOS launch agent that renews the session periodically.")
-      .option("--interval <minutes>", "Renewal interval in minutes.", parsePositiveInt),
+      .option("--interval <minutes>", "Renewal interval in minutes.", parsePositiveInt)),
   ).action(async (options: OutputCommandOptions & { interval?: number }) => {
-    await runtime.baseUrl();
+    const globals = program.opts();
+    if (!await confirm(
+      { summary: `Install the Moodle session keepalive agent${options.interval ? ` with a ${options.interval}-minute interval` : ""}.` },
+      { yes: Boolean(globals.yes), dryRun: Boolean(globals.dryRun), interactive: human() },
+    )) return;
+    const baseUrl = await runtime.baseUrl();
+    await getAuthenticatedSessionWithBrowserFallback(baseUrl, { env: io.env, homeDir: io.homeDir, fetch: io.fetchImpl, noCache: true, nonInteractive: true, captureMobileToken: true });
     const result = await installKeepalive({ homeDir: io.homeDir, intervalMinutes: options.interval });
-    runtime.output(result, () => `Keepalive installed: renews every ${result.interval_minutes} min\nAgent: ${result.plist_path}\nLog: ${result.log_path}`, options);
+    await runtime.output(result, () => `Keepalive installed: renews every ${result.interval_minutes} min\nAgent: ${result.plist_path}\nLog: ${result.log_path}`, options);
   });
 
-  addOutputOptions(keepalive.command("uninstall").description("Remove the keepalive launch agent.")).action(
+  addOutputOptions(mutating(keepalive.command("uninstall").description("Remove the keepalive launch agent."))).action(
     async (options: OutputCommandOptions) => {
+      const globals = program.opts();
+      if (!await confirm(
+        { summary: "Remove the Moodle session keepalive agent." },
+        { yes: Boolean(globals.yes), dryRun: Boolean(globals.dryRun), interactive: human() },
+      )) return;
       const result = await uninstallKeepalive({ homeDir: io.homeDir });
-      runtime.output(result, () => `Keepalive removed (${result.plist_path})`, options);
+      await runtime.output(result, () => `Keepalive removed (${result.plist_path})`, options);
     },
   );
 
   addOutputOptions(keepalive.command("status").description("Show whether the keepalive launch agent is installed.")).action(
     async (options: OutputCommandOptions) => {
       const result = await keepaliveStatus(io.homeDir);
-      runtime.output(result, () => (result.installed ? `Keepalive installed (${result.plist_path})` : "Keepalive not installed"), options);
+      await runtime.output(result, () => (result.installed ? `Keepalive installed (${result.plist_path})` : "Keepalive not installed"), options);
     },
   );
 
-  addOutputOptions(program.command("update").description("Check for updates and upgrade the installed CLI."))
-    .option("--check-only", "Only check for updates; do not install.")
-    .action(async (options: OutputCommandOptions & { checkOnly?: boolean }) => {
-      try {
-        const info = await checkForUpdates(VERSION, io.fetchImpl);
-        if (outputFormat(options, stdout) !== "table") {
-          runtime.output(info, () => "", options);
-          return;
-        }
-        if (!info.update_available) {
-          stdout.write(`${info.package_name} is up to date (${info.current_version})\n`);
-          return;
-        }
-        stdout.write(`Update available: ${info.latest_version} (installed: ${info.current_version})\n`);
-        if (options.checkOnly) {
-          stdout.write(`Upgrade with: ${info.upgrade_commands.join(" && ")}\n`);
-          return;
-        }
-        stdout.write(`Updated with: ${applySelfUpdate()}\n`);
-      } catch (error) {
-        stdout.write(`Could not check for updates: ${error instanceof Error ? error.message : String(error)}\n`);
-      }
+  const mcp = program.command("mcp").description("Deploy a private MCP Worker on Cloudflare; encrypted session storage and local renewal. Free-tier limits apply.").summary("Private MCP server on Cloudflare");
+  addOutputOptions(mutating(mcp.command("deploy").description("Deploy or update the managed Moodle MCP server.")))
+    .option("--dry-run", "Preview deployment changes without applying them.")
+    .option("--repair", "Repair authentication and managed deployment state.")
+    .option("--rotate-key", "Rotate the session encryption key and migrate the active session.")
+    .option("--rotate-token", "Rotate the MCP access token. The old token and every connected OAuth client stop working at once; reconnect them after.")
+    .option("--rollback", "Restore the previous healthy Worker release.")
+    .action(async (options: OutputCommandOptions & { dryRun?: boolean; repair?: boolean; rotateToken?: boolean; rotateKey?: boolean; rollback?: boolean }) => {
+      const dryRun = Boolean(options.dryRun || program.opts().dryRun);
+      if (!dryRun && !await confirm(
+        { summary: [ONBOARDING_COPY.introduction, "", ONBOARDING_COPY.credentials].join("\n") },
+        {
+          yes: Boolean(program.opts().yes),
+          dryRun: false,
+          interactive: human(),
+        },
+      )) return;
+      const result = await getMcpService().deploy({
+        dryRun,
+        repair: Boolean(options.repair),
+        rotateToken: Boolean(options.rotateToken),
+        rotateKey: Boolean(options.rotateKey),
+        rollback: Boolean(options.rollback),
+        yes: Boolean(program.opts().yes),
+      });
+      await outputMcpResult(runtime, result, options);
     });
 
-  const skills = program.command("skills").description("Show skill metadata or delegate to the shared skills CLI.");
+  addOutputOptions(mcp.command("status").description("Show local and remote Moodle MCP readiness."))
+    .option("--verbose", "Include sanitized deployment diagnostics.")
+    .option("--logs", "Include sanitized recent Worker logs.")
+    .action(async (options: OutputCommandOptions & { verbose?: boolean; logs?: boolean }) => {
+      const result = await getMcpService().status({
+        verbose: Boolean(options.verbose || program.opts().verbose),
+        logs: Boolean(options.logs),
+      });
+      await outputMcpResult(runtime, result, options);
+    });
+
+  addOutputOptions(mutating(mcp.command("login").description("Acquire and upload a fresh Moodle session."))).action(
+    async (options: OutputCommandOptions) => {
+      await outputMcpResult(runtime, await getMcpService().login(), options);
+    },
+  );
+
+  addOutputOptions(mutating(mcp.command("connect").description("Connect a supported MCP client.").argument("[client]", "Codex, Claude, VS Code, or Cursor")))
+    .option("--mode <mode>", "Use bridge or native remote mode.", parseMcpConnectionMode, "bridge")
+    .option("--show-token", "Reveal the MCP token once after confirmation.")
+    .action(async (client: string | undefined, options: OutputCommandOptions & { mode: "bridge" | "remote"; showToken?: boolean }) => {
+      if (options.showToken) {
+        const tty = Boolean(stdout && "isTTY" in stdout && stdout.isTTY);
+        if (!tty || outputFormat(options, stdout) !== "table") {
+          throw new UsageError("--show-token requires human output on an interactive TTY.");
+        }
+        if (!await confirm(
+          { summary: "Reveal the managed MCP access token once in this terminal." },
+          { yes: Boolean(program.opts().yes), dryRun: false, interactive: true },
+        )) return;
+      }
+      const result = await getMcpService().connect({ client, mode: options.mode, showToken: Boolean(options.showToken) });
+      await outputMcpResult(runtime, result, options);
+    });
+
+  addOutputOptions(mcp.command("clients").description("List pending and approved OAuth clients.")).action(async (options: OutputCommandOptions) => {
+    await outputMcpResult(runtime, await getMcpService().manageClients({}), options);
+  });
+  addOutputOptions(mutating(mcp.command("revoke").description("Revoke an OAuth client or all OAuth access.").argument("[client-id]", "OAuth client id; omit with --all")))
+    .option("--all", "Revoke every client, token, pending authorization, and pairing window.")
+    .action(async (clientId: string | undefined, options: OutputCommandOptions & { all?: boolean }) => {
+      if (Boolean(clientId) === Boolean(options.all)) throw new UsageError("Provide a client ID or --all.");
+      const summary = clientId
+        ? `Revoke OAuth client ${clientId}. It loses access at once and has to pair again to reconnect.`
+        : "Revoke all OAuth access: every client, token, pending authorization, and pairing window. Claude and every other connected client lose access at once and have to pair again.";
+      if (program.opts().dryRun) return runtime.output({ planned: "revoke", client_id: clientId ?? null, all: Boolean(options.all) }, () => summary, options);
+      if (!await confirm({ summary }, { yes: Boolean(program.opts().yes), dryRun: false, interactive: human() })) return;
+      await outputMcpResult(runtime, await getMcpService().manageClients({ revoke: true, clientId }), options);
+    });
+
+  addOutputOptions(mutating(mcp.command("pair").description("Open a pairing window so Claude can connect to the remote MCP server.").summary("Open a pairing window for Claude"))).action(
+    async (options: OutputCommandOptions) => {
+      await outputMcpResult(runtime, await getMcpService().pair(), options);
+    },
+  );
+
+  addOutputOptions(mutating(mcp.command("remove").description("Remove one managed Moodle MCP deployment."))).action(
+    async (options: OutputCommandOptions) => {
+      await outputMcpResult(runtime, await getMcpService().remove({ yes: Boolean(program.opts().yes) }), options);
+    },
+  );
+
+  // stdio is the only transport, so asking for it is ceremony; the flag stays for
+  // client configurations that already pass it.
+  mcp.command("serve").description("Run the local Moodle MCP server over stdio.").option("--stdio", "Use JSON messages over stdio (the default).").action(
+    async () => {
+      await getMcpService().serveStdio();
+    },
+  );
+
+  mcp.command("bridge").description("Bridge a stdio MCP client to the managed remote server.")
+    .option("--profile <profile>", "Use a specific managed Moodle profile.")
+    .action(async (options: { profile?: string }) => {
+      await getMcpService().bridge(options.profile);
+    });
+
+  const renewal = mcp.command("renewal").description("Run the installed managed-session renewal job.");
+  addOutputOptions(renewal.command("run").description("Check and renew one managed Moodle session."))
+    .requiredOption("--profile <profile>", "Use a specific managed Moodle profile.")
+    .action(async (options: OutputCommandOptions & { profile: string }) => {
+      await outputMcpResult(runtime, await getMcpService().renew(options.profile), options);
+    });
+
+  const mcpSession = mcp.command("session").description("Advanced managed-session operations.");
+  addOutputOptions(mutating(mcpSession.command("push").description("Upload a Moodle cookie from standard input.").option("--stdin", "Read the cookie from standard input.")))
+    .action(async (options: OutputCommandOptions & { stdin?: boolean }) => {
+      if (!options.stdin) throw new UsageError("moodle mcp session push requires --stdin.");
+      await outputMcpResult(runtime, await getMcpService().pushSessionFromStdin(), options);
+    });
+
+  addOutputOptions(program.command("commands").description("Describe the complete command tree.")).action(
+    async (options: OutputCommandOptions) => {
+      const description = describeProgram(program);
+      await runtime.output(description, () => JSON.stringify(description, null, 2), options);
+    },
+  );
+
+  const skills = program.command("skills").description("Show skill metadata or delegate to the shared skills CLI.").summary("Agent skill metadata");
   skills.action(() => {
     stdout.write(`${formatSkillSummary()}\n`);
   });
@@ -487,32 +970,83 @@ export function buildProgram(io: CliIO = {}): Command {
     stdout.write("Generated Moodle skill bundle\n");
   });
   skills.command("add").description("Install the published skill through npx skills add.").allowUnknownOption(true).action((_options, command) => installSkill(command.args));
-  hideCommand(skills.command("install").allowUnknownOption(true)).action((_options: unknown, command: Command) => installSkill(command.args));
-  hideCommand(skills.command("i").allowUnknownOption(true)).action((_options: unknown, command: Command) => installSkill(command.args));
 
+  for (const [title, names] of Object.entries(HELP_SECTIONS)) {
+    // Placed in the order the list names them: that order is the help page.
+    for (const name of names) for (const command of program.commands) if (command.name() === name) helpSection(command, title);
+  }
+  examples(program, [
+    "moodle  # today: due items, alerts and news",
+    "moodle UNIT grades",
+    "moodle submit UNIT \"Assignment 2\" report.pdf",
+  ]);
   return program;
 }
+
+// Grouped the way `gh` does: what a person reaches for daily, then the rest, then what only an agent runs.
+const HELP_SECTIONS: Readonly<Record<string, readonly string[]>> = {
+  "Core commands": ["due", "news", "find", "get", "open", "submit", "quiz", "units", "activities", "grades", "threads", "forums"],
+  "Additional commands": ["user", "todo", "alerts", "overview", "download", "auth", "doctor", "completion", "uninstall"],
+  "Agent commands": ["mcp", "commands", "skills"],
+};
 
 export async function runCli(argv = process.argv, io: CliIO = {}): Promise<number> {
   const stderr = io.stderr ?? process.stderr;
   const stdout = io.stdout ?? process.stdout;
-  const program = buildProgram({ ...io, rootArgs: argv.slice(2) });
+  const args = insertDefaultVerb(argv.slice(2), NOUNS);
+  const ui = createUi({
+    input: io.stdin ?? process.stdin,
+    output: stderr as Writable,
+    interactive: detectAudience({
+      stdin: io.stdin ?? process.stdin,
+      stdout: { isTTY: Boolean(stdout && "isTTY" in stdout && stdout.isTTY) },
+      env: io.env ?? process.env,
+      format: errorOutputFormat(args, stdout),
+    }) === "human",
+  });
   try {
-    await program.parseAsync(argv, { from: "node" });
+    await startupUpdateNotice(args, stderr, { homeDir: io.homeDir, env: io.env });
+    await parseWithPrompts(() => buildProgram({ ...io, rootArgs: args }), args, { ui, fillers: { unit: pickUnit(io, ui) } });
     return 0;
   } catch (error) {
-    if (error instanceof CommanderError) {
-      if (error.code === "commander.helpDisplayed" || error.code === "commander.version") {
-        return 0;
-      }
-      const cliError = new UsageError(error.message);
-      writeError(cliError, stderr, wantsJsonFromArgs(argv, stdout));
-      return cliError.exitCode;
+    if (isInformationalExit(error)) {
+      return 0;
     }
-    const cliError = toCliError(error);
-    writeError(cliError, stderr, wantsJsonFromArgs(argv, stdout));
-    return cliError.exitCode;
+    const format = errorOutputFormat(args, stdout);
+    const normalized = normalizeError(asNetworkError(error) ?? error);
+    const reference = error instanceof ReferenceError ? error : undefined;
+    const reported = reportError(asNetworkError(error) ?? error, "json");
+    const envelope = JSON.parse(reported.text);
+    const hint = reference?.hint || normalized.hint || ({ auth: "Run moodle auth login, or moodle doctor.", config: "Run moodle doctor to check configuration.", not_found: "Run moodle units or moodle find QUERY.", usage: "Run moodle --help or moodle commands --json.", upstream: "Run moodle doctor, then retry.", network: "Check the connection, then retry.", unexpected: "Run moodle doctor; use --verbose for request timings.", cancelled: "Retry when ready." }[normalized.code]);
+    envelope.error.hint = hint;
+    if (reference) { envelope.error.code = reference.code; envelope.error.message = reference.message; envelope.error.candidates = reference.candidates; envelope.exit_code = reference.code === "ambiguous" ? 2 : 4; }
+    stderr.write(format === "table" ? `✗ ${String(envelope.error.message).replace(/\s+/gu, " ")}\n${hint}\n` : `${JSON.stringify(envelope)}\n`);
+    return envelope.exit_code;
   }
+}
+
+/**
+ * Suggest the command that clears the worst check, not a fixed pair. Telling a
+ * user to run `moodle auth login` when the cookie store is unreadable sends
+ * them straight back into the failure they just reported.
+ */
+function openInBrowser(url: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer.exe" : "xdg-open", [url], { stdio: "ignore" });
+    child.once("error", reject);
+    child.once("exit", code => code === 0 ? resolve() : reject(new Error("Could not open the browser.")));
+  });
+}
+
+function doctorNextSteps(checks: ReadonlyArray<{ name: string; status: string }>): string[] {
+  const failing = new Set(checks.filter(c => c.status !== "pass").map(c => c.name));
+  const steps: string[] = [];
+  if (failing.has("browser")) steps.push("grant Full Disk Access, then rerun moodle doctor");
+  else if (failing.has("session")) steps.push("moodle auth login");
+  if (failing.has("sqlite")) steps.push("install Node 22.13+ or Bun");
+  if (failing.has("config")) steps.push("moodle units");
+  if (failing.has("job")) steps.push("moodle auth keepalive install");
+  return steps.length ? steps : ["moodle todo", "moodle mcp status"];
 }
 
 async function dispatchUrl(runtime: Runtime, target: string, options: OutputCommandOptions): Promise<void> {
@@ -522,99 +1056,39 @@ async function dispatchUrl(runtime: Runtime, target: string, options: OutputComm
   if (!first) {
     throw new UsageError("Unsupported Moodle URL.");
   }
+  const service = createIntentService(createMoodleGateway(client));
+  let result: Record<string, unknown>;
   switch (resolved.commandName) {
-    case "assign": {
-      const item = await client.getAssignment(Number(first));
-      runtime.output(item, () => formatActivityDetail(item), options);
-      return;
+    case "assign": case "quiz": case "resource": case "link": case "page": case "folder": {
+      const loaders = { assign: () => client.getAssignment(Number(first)), quiz: () => client.getQuiz(Number(first)), resource: () => client.getResource(Number(first)), link: () => client.getLink(Number(first)), page: () => client.getPage(Number(first)), folder: () => client.getFolder(Number(first)) };
+      result = { item: activitySchema.parse(stripEmpty(itemRow({ ...await loaders[resolved.commandName](), type: resolved.commandName }))) };
+      break;
     }
-    case "quiz": {
-      const item = await client.getQuiz(Number(first));
-      runtime.output(item, () => formatActivityDetail(item), options);
-      return;
-    }
-    case "resource": {
-      const item = await client.getResource(Number(first));
-      runtime.output(item, () => formatActivityDetail(item), options);
-      return;
-    }
-    case "link": {
-      const item = await client.getLink(Number(first));
-      runtime.output(item, () => formatActivityDetail(item), options);
-      return;
-    }
-    case "page": {
-      const item = await client.getPage(Number(first));
-      runtime.output(item, () => formatActivityDetail(item), options);
-      return;
-    }
-    case "folder": {
-      const item = await client.getFolder(Number(first));
-      runtime.output(item, () => formatActivityDetail(item), options);
-      return;
-    }
-    case "course": {
-      const sections = await client.getCourseContents(Number(first));
-      runtime.output(sections, () => formatCourseSections(sections), options);
-      return;
-    }
-    case "grades": {
-      const grades = await client.getCourseGrades(Number(first));
-      runtime.output(grades, () => formatGrades(grades), options);
-      return;
-    }
+    case "course": result = await service.run("unit", { unit: Number(first) }); break;
+    case "grades": result = await service.run("grades", { unit: Number(first) }); break;
     case "forum:discussion": {
-      const postHash = resolved.args?.[1] ?? "";
-      const postId = postHash.startsWith("#p") ? Number(postHash.slice(2)) : null;
-      const discussion = filterDiscussionToPost(await client.getForumDiscussion(Number(first)), Number.isFinite(postId) ? postId : null);
-      runtime.output(discussion, () => formatForumDiscussion(discussion), options);
-      return;
+      result = await service.run("thread", { discussion_id: Number(first) });
+      const hash = resolved.args?.[1];
+      if (hash?.startsWith("#p")) {
+        const discussion = await client.getForumDiscussion(Number(first));
+        const posts = discussion.posts.filter(p => p.id === Number(hash.slice(2)));
+        result = stripEmpty({ thread: { id: discussion.id, name: discussion.subject, unit_id: discussion.course_id, forum_id: discussion.forum_id, url: discussion.url, posts: posts.map(p => postRow(p, discussion.subject)), posts_total: posts.length, offset: 0 } }) as Record<string, unknown>;
+      }
+      break;
     }
     case "forum:discussions": {
       const refs = await client.getForumDiscussionRefs(Number(first));
-      runtime.output(refs, () => formatForumDiscussionRefs(Number(first), refs), options);
-      return;
+      result = stripEmpty({ threads: refs.slice(0, 50).map(t => ({ id: t.id, name: t.subject })), total: refs.length }) as Record<string, unknown>;
+      await runtime.output(result, () => formatForumDiscussionRefs(Number(first), refs.slice(0, 50)), options); return;
     }
-    default:
-      throw new UsageError("Unsupported Moodle URL.");
+    default: throw new UsageError("Unsupported Moodle URL.");
   }
+  await runtime.output(result, () => runtime.screen(result, options), options);
 }
 
-function addCourseCommand(
-  program: Command,
-  runtime: Runtime,
-  name: string,
-  description: string,
-  load: (client: MoodleClient, courseId: number) => Promise<unknown>,
-  format: (value: never) => string,
-): void {
-  addOutputOptions(program.command(name).description(description).argument("<course>", "Course ID or unique name")).action(async (course: string, options: OutputCommandOptions) => {
-    const client = await runtime.getClient();
-    const courseId = await client.resolveCourseReference(course);
-    const value = await load(client, courseId);
-    runtime.output(value, () => format(value as never), options);
-  });
-}
-
-function addActivityCommand(
-  program: Command,
-  runtime: Runtime,
-  name: string,
-  label: string,
-  path: string,
-  load: (client: MoodleClient, id: number) => Promise<unknown>,
-): Command {
-  return addOutputOptions(program.command(name).description(`Show ${label.toLowerCase()} details.`).argument(`<${name}>`, `${label} ID or URL`)).action(
-    async (value: string, options: OutputCommandOptions) => {
-      const id = parseActivityReference(value, label, path);
-      const item = await load(await runtime.getClient(), id);
-      runtime.output(item, () => formatActivityDetail(item as never), options);
-    },
-  );
-}
-
-function addForumSearchCommand(command: Command, runtime: Runtime, defaultLimit: number, findMode: boolean): void {
+function addForumSearchCommand(command: Command, runtime: Runtime, defaultLimit: number): void {
   addOutputOptions(command.argument("<query>", "Search query"))
+    .option("--unit <unit>", "Restrict to a unit code, name, id or URL.")
     .option("--course <course>", "Restrict to a course ID or unique course name match.")
     .option("--forum <forum>", "Restrict to a forum ID or forum URL.")
     .option("--titles-only", "Only search discussion titles.")
@@ -623,74 +1097,80 @@ function addForumSearchCommand(command: Command, runtime: Runtime, defaultLimit:
     .option("--limit-forums <number>", "Maximum number of forums to scan.", parsePositiveInt)
     .option("--limit-discussions <number>", "Maximum number of discussions per forum.", parsePositiveInt)
     .option("--limit <number>", "Maximum number of matches.", parsePositiveInt, defaultLimit)
-    .action(async (query: string, options: OutputCommandOptions & { course?: string; forum?: string; titlesOnly?: boolean; unreadOnly?: boolean; recent?: boolean; limitForums?: number; limitDiscussions?: number; limit: number; list?: boolean; body?: boolean }) => {
+    .action(async (query: string, options: OutputCommandOptions & { course?: string; unit?: string; forum?: string; titlesOnly?: boolean; unreadOnly?: boolean; recent?: boolean; limitForums?: number; limitDiscussions?: number; limit: number }) => {
       const client = await runtime.getClient();
-      const courseId = options.course ? await client.resolveCourseReference(options.course) : undefined;
+      const courseId = options.unit || options.course ? await client.resolveCourseReference((options.unit || options.course)!) : undefined;
       const forumCmid = options.forum
         ? await parseForumReference(options.forum, (discussionId) => client.getForumViewCmid(discussionId))
         : undefined;
-      const limit = findMode && !options.list ? 1 : options.limit;
-      const hits = await client.searchForumContent({
-        query,
-        limit,
-        courseId,
-        forumCmid,
-        includePostText: !options.titlesOnly,
-        unreadOnly: options.unreadOnly,
-        sortBy: options.recent || findMode ? "recent" : "relevance",
-        maxForums: options.limitForums,
-        maxDiscussionsPerForum: options.limitDiscussions,
-      });
-      if (findMode && options.body && hits[0]) {
-        const discussion = filterDiscussionToPost(await client.getForumDiscussion(hits[0].discussion_id), hits[0].post_id || null);
-        runtime.output(discussion, () => formatForumDiscussion(discussion, { showBody: true }), options);
-        return;
-      }
-      const output = findMode && !options.list ? (hits[0] ?? null) : hits;
-      runtime.output(output, () => formatForumSearchHits(Array.isArray(output) ? output : output ? [output] : []), options);
+      const result = await createIntentService(createMoodleGateway(client)).run("search_forums", { query, courseId, forumId: forumCmid, limit: runtime.count("limit", options.limit), includePostText: true, titlesOnly: options.titlesOnly, unreadOnly: options.unreadOnly, sortBy: options.recent ? "recent" : "relevance", maxForums: options.limitForums, maxDiscussionsPerForum: options.limitDiscussions });
+      await runtime.output(result, () => runtime.screen(result, options), options);
     });
 }
 
+// Accepted after every command, but the root page already lists them as global options;
+// repeating the five on each page buried the flags that matter.
 function addOutputOptions(command: Command): Command {
-  return command
-    .option("--json", "Output as JSON.")
-    .option("--yaml", "Output as YAML.")
-    .option("--table", "Force human output.")
-    .option("--fields <fields>", "Keep only listed top-level fields in structured output.");
-}
-
-function hideCommand(command: Command): Command {
-  (command as Command & { hidden?: boolean }).hidden = true;
+  for (const [flags, description] of [
+    ["--pretty", "Indent JSON output."],
+    ["--json", "Output as JSON."],
+    ["--yaml", "Output as YAML."],
+    ["--table", "Force human output."],
+    ["--fields <fields>", "Keep only listed top-level fields in structured output."],
+  ]) command.addOption(command.createOption(flags, description).hideHelp());
   return command;
 }
 
 function outputFormat(options: OutputCommandOptions, stdout: CliIO["stdout"]): OutputFormat {
-  if (options.yaml) {
-    return "yaml";
-  }
-  if (options.json) {
-    return "json";
-  }
-  if (options.table) {
-    return "table";
-  }
-  return "isTTY" in (stdout as NodeJS.WriteStream) && (stdout as NodeJS.WriteStream).isTTY ? "table" : "json";
+  return resolveFormat(options, Boolean(stdout && "isTTY" in stdout && stdout.isTTY));
 }
 
-function parseCmidReference(value: string): number {
-  const raw = value.trim();
-  if (/^\d+$/.test(raw)) {
-    return Number(raw);
+// What is sent and where it lands are the two facts to check before saying yes, so each gets its own role and line.
+// Shown before every quiz write and in `moodle quiz --help`; the person must say yes to it.
+const QUIZ_NOTICE = [
+  "moodle quiz is beta: it replays the browser's quiz forms, and a Moodle update can break it without warning.",
+  "Academic integrity: answers you send are your own submission under your institution's rules. Only use this",
+  "where the quiz allows it, and check the attempt in a browser before you finish.",
+];
+
+// The key appears as a form field (in either attribute order and either quote style),
+// as a script value and as a URL parameter; every spelling is hidden.
+export function redactSesskey(html: string): string {
+  return html
+    .replace(/<input\b[^>]*>/giu, (tag) => (/\bname\s*=\s*["']?sesskey["']?/iu.test(tag) ? tag.replace(/(\bvalue\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s>]+)/iu, '$1"REDACTED"') : tag))
+    .replace(/(["']?sesskey["']?\s*[:=]\s*["']?)[A-Za-z0-9]{8,}/gu, "$1REDACTED");
+}
+
+function quizStartSummary(plan: QuizStartPlan, theme: Theme): string {
+  const lines = [`${theme.dim(plan.action === "continue" ? "Continue" : "   Start")}  ${theme.target(plan.name || `quiz ${plan.quiz_id}`)}`];
+  if (plan.action === "start") {
+    const allowed = Number.parseInt(plan.attempts_allowed, 10);
+    const number = plan.attempts_used + 1;
+    lines.push(`${theme.dim(" Attempt")}  ${number}${Number.isFinite(allowed) ? ` of ${allowed}` : ""}${Number.isFinite(allowed) && number >= allowed ? ` ${theme.tone("danger", "(your last)")}` : ""}`);
+    if (plan.grading_method) lines.push(`${theme.dim(" Grading")}  ${plan.grading_method}`);
   }
-  try {
-    const id = new URL(raw).searchParams.get("id");
-    if (id && /^\d+$/.test(id)) {
-      return Number(id);
-    }
-  } catch {
-    // not a URL
-  }
-  throw new UsageError("Activity must be a course module ID or an activity view.php?id=... URL.");
+  lines.push(plan.time_limit
+    ? `${theme.dim("    Time")}  ${plan.time_limit}; ${theme.tone("warning", plan.action === "continue" ? "the clock is already running" : "the timer starts now and does not pause")}`
+    : `${theme.dim("    Time")}  no time limit shown`);
+  lines.push(theme.dim(plan.action === "continue" ? "Moodle reopens the attempt in progress." : "Moodle records the attempt and its start time."));
+  return lines.join("\n");
+}
+
+function submissionSummary(plan: SubmissionReceipt, final: boolean, theme: Theme): string {
+  const destination = `${theme.target(plan.name)}${plan.unit_id ? theme.dim(`  unit ${plan.unit_id}`) : ""}`;
+  const lines = plan.uploads.length
+    ? [`${theme.dim("Upload")}  ${theme.subject(plan.uploads.map(file => file.name).join(", "))}`, `${theme.dim("    to")}  ${destination}`]
+    : [`${theme.dim("Submit")}  ${destination}`, `${theme.dim("      ")}  ${theme.subject("the files already there")} for grading`];
+  if (plan.removed.length) lines.push(`${theme.dim("Remove")}  ${theme.tone("danger", plan.removed.join(", "))} ${theme.dim("first")}`);
+  if (plan.statement) lines.push(`${theme.dim(" Agree")}  "${plan.statement}"`);
+  if (plan.group) lines.push(`${theme.dim(" Group")}  ${theme.subject(plan.group)} ${theme.dim("shares these files: every change reaches the whole group")}`);
+  // The plan refuses a non-final save unless Moodle showed a draft stage, so each line states a fact.
+  lines.push(!final
+    ? theme.dim("Saved as a draft; nothing is submitted for grading.")
+    : plan.draft_stage === false
+      ? theme.tone("warning", "This assignment has no draft stage: saving submits it for grading. Moodle does not allow undoing this.")
+      : theme.tone("warning", `Then submit ${plan.group ? "the group's work " : ""}for grading. Moodle does not allow undoing this.`));
+  return lines.join("\n");
 }
 
 function parsePositiveInt(value: string): number {
@@ -701,24 +1181,64 @@ function parsePositiveInt(value: string): number {
   return parsed;
 }
 
-function writeError(error: CliError, stderr: CliIO["stderr"], asJson: boolean): void {
-  if (asJson) {
-    stderr?.write(`${errorJson(error.code, error.message, error.hint)}\n`);
-    return;
-  }
-  stderr?.write(`${labelFor(error)}: ${error.message}\n`);
-  if (error instanceof ConfigError && error.hint) {
-    stderr?.write(`${error.hint}\n`);
-  } else if (error.hint) {
-    stderr?.write(`${error.hint}\n`);
-  }
-  if (error instanceof MoodleAPIError && error.moodleErrorCode) {
-    stderr?.write(`Error code: ${error.moodleErrorCode}\n`);
+function parseMcpConnectionMode(value: string): "bridge" | "remote" {
+  if (value === "bridge" || value === "remote") return value;
+  throw new UsageError("MCP connection mode must be 'bridge' or 'remote'.");
+}
+
+async function outputMcpResult(runtime: Runtime, result: McpCommandOutput, options: OutputCommandOptions): Promise<void> {
+  await runtime.output(result.data, () => (result.next?.length ? `${result.text}\n\n${tryLines(result.next)}` : result.text), options);
+}
+
+function errorOutputFormat(args: string[], stdout: CliIO["stdout"]): OutputFormat {
+  try {
+    return resolveFormat(parseRootOutputOptions(args), Boolean(stdout && "isTTY" in stdout && stdout.isTTY));
+  } catch {
+    return "json";
   }
 }
 
-function wantsJsonFromArgs(argv: string[], stdout: CliIO["stdout"]): boolean {
-  return argv.includes("--json") || (!argv.includes("--table") && !("isTTY" in (stdout as NodeJS.WriteStream) && (stdout as NodeJS.WriteStream).isTTY));
+function parseFields(data: unknown, value?: string): string[] | undefined {
+  const fields = value?.split(",").map((field) => field.trim()).filter(Boolean);
+  if (value !== undefined && !fields?.length) {
+    throw new UsageError("--fields must include at least one field.");
+  }
+  if (fields?.length) {
+    const values = Array.isArray(data) ? data : [data];
+    const sample = values.find((item) => item && typeof item === "object" && !Array.isArray(item)) as Record<string, unknown> | undefined;
+    if (!sample) {
+      throw new UsageError("--fields can only be used with object or object-array output.");
+    }
+    const valid = Object.keys(sample);
+    const invalid = fields.find((field) => !valid.includes(field));
+    if (invalid) {
+      throw new UsageError(`Unknown field '${invalid}'. Valid fields: ${valid.join(", ")}`);
+    }
+  }
+  return fields;
+}
+
+// A person who typed `moodle activities` is shown their units rather than a usage error.
+function pickUnit(io: CliIO, ui: Ui): ArgumentFiller {
+  return async () => {
+    const spin = ui.spinner();
+    spin.start("Loading your units");
+    try {
+      return await selectUnit(spin);
+    } catch (error) {
+      // Otherwise the spinner keeps drawing over the session error.
+      spin.stop("Could not load your units");
+      throw error;
+    }
+  };
+
+  async function selectUnit(spin: ReturnType<Ui["spinner"]>): Promise<string> {
+    const { baseUrl } = await loadConfig({ env: io.env, cwd: io.cwd, homeDir: io.homeDir, stdin: io.stdin, stderr: (io.stderr ?? process.stderr) as NodeJS.WritableStream, fetch: io.fetchImpl });
+    const client = await createMoodleClient(baseUrl, { env: io.env, fetchImpl: io.fetchImpl, homeDir: io.homeDir });
+    const courses = await client.getCourses();
+    spin.stop(`${courses.length} units`);
+    return ui.select("Which unit?", courses.map(course => ({ value: String(course.id), label: course.fullname, ...(course.shortname ? { hint: course.shortname } : {}) })));
+  }
 }
 
 function parseRootOutputOptions(args: string[]): OutputCommandOptions {
@@ -729,27 +1249,12 @@ function parseRootOutputOptions(args: string[]): OutputCommandOptions {
     throw new UsageError("--fields requires a value.");
   }
   return {
+    pretty: args.includes("--pretty"),
     json: args.includes("--json"),
     yaml: args.includes("--yaml"),
     table: args.includes("--table"),
     fields,
   };
-}
-
-function labelFor(error: CliError): string {
-  if (error.code === "auth_failed") {
-    return "Auth error";
-  }
-  if (error.code === "config_error") {
-    return "Config error";
-  }
-  if (error.code === "usage_error") {
-    return "Usage error";
-  }
-  if (error.code === "not_found") {
-    return "Not found";
-  }
-  return "Error";
 }
 
 function queryMatches(text: string, query: string): boolean {
@@ -758,9 +1263,19 @@ function queryMatches(text: string, query: string): boolean {
   return needle ? haystack.includes(needle) || needle.split(" ").every((token) => haystack.includes(token)) : true;
 }
 
-const isMain = process.argv[1] ? realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]) : false;
+function pathsReferToSameFile(moduleUrl: string, executable: string | undefined): boolean {
+  if (!executable) return false;
+  try {
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(executable);
+  } catch {
+    return false;
+  }
+}
+
+const isMain = (import.meta as ImportMeta & { main?: boolean }).main === true || pathsReferToSameFile(import.meta.url, process.argv[1]);
 if (isMain) {
   runCli().then((code) => {
-    process.exitCode = code;
+    // A command that ran fine but reported a failure (doctor) sets its own code.
+    process.exitCode = code || process.exitCode;
   });
 }

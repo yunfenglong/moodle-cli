@@ -2,20 +2,15 @@ import type {
   Activity,
   AlertNotification,
   AlertSummary,
-  CalendarEvent,
-  Conversation,
-  ConversationDetail,
-  ConversationMessage,
   Course,
   ForumDiscussion,
   ForumPost,
   ForumPostAuthor,
-  GradeOverviewRow,
   Section,
   TodoItem,
   UserInfo,
 } from "./models.js";
-import { htmlToStructuredContent } from "./html-utils.js";
+import { htmlToStructuredContent, resolveUrl } from "./html-utils.js";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -44,6 +39,7 @@ export function parseUserInfo(value: unknown): UserInfo {
     sitename: stringValue(data.sitename),
     siteurl: stringValue(data.siteurl),
     lang: stringValue(data.lang),
+    ...(data.timezone ? { timezone: String(data.timezone) } : {}),
   };
 }
 
@@ -58,7 +54,7 @@ export function parseCourse(value: unknown, nowSeconds = Math.floor(Date.now() /
     startdate: numberValue(data.startdate),
   };
   const enddate = numberValue(data.enddate);
-  if (enddate > nowSeconds) {
+  if (enddate > 0) {
     course.enddate = enddate;
   }
   return course;
@@ -77,6 +73,8 @@ export function parseActivity(value: unknown): Activity {
     url: stringValue(data.url),
     visible: booleanValue(data.visible, true),
     description: stringValue(data.description),
+    ...(data.completiondata && typeof data.completiondata === "object" ? { completion: numberValue(asRecord(data.completiondata).state) } : {}),
+    ...(Array.isArray(data.contents) ? { file_entries: data.contents.filter((f: unknown) => asRecord(f).fileurl).map((f: unknown) => ({ name: stringValue(asRecord(f).filename), url: stringValue(asRecord(f).fileurl), requires_authentication: true })) } : {}),
   };
 }
 
@@ -88,12 +86,64 @@ export function parseSection(value: unknown): Section {
     section: numberValue(data.section),
     visible: booleanValue(data.visible, true),
     summary: stringValue(data.summary),
+    ...(data.current !== undefined ? { current: booleanValue(data.current) } : {}),
     activities: asArray(data.modules).map((item) => parseActivity(item)),
   };
 }
 
 export function parseCourseContents(value: unknown): Section[] {
   return asArray(value).map((item) => parseSection(item));
+}
+
+export function parseCourseFormatState(value: unknown, baseUrl: string): Section[] {
+  const state = asRecord(parseJsonValue(value));
+  const activities = new Map<string, Activity>();
+  const activitiesBySection = new Map<string, Activity[]>();
+  for (const item of asArray(state.cm)) {
+    const data = asRecord(item);
+    const id = numberValue(data.id);
+    const sectionId = stringValue(data.sectionid);
+    const module = stringValue(data.module)
+      || stringValue(data.plugin).replace(/^mod_/u, "")
+      || stringValue(data.modname).toLowerCase();
+    const activity: Activity = {
+      id,
+      name: htmlText(data.name, baseUrl),
+      modname: module.toLowerCase(),
+      url: stringValue(data.url) ? resolveUrl(baseUrl, stringValue(data.url)) : "",
+      visible: booleanValue(data.visible, true)
+        && booleanValue(data.uservisible, true)
+        && !booleanValue(data.stealth),
+      description: htmlText(data.content ?? data.description, baseUrl),
+      ...(data.completionstate !== undefined && data.completionstate !== null ? { completion: numberValue(data.completionstate) } : {}),
+    };
+    activities.set(String(id), activity);
+    const sectionActivities = activitiesBySection.get(sectionId) ?? [];
+    sectionActivities.push(activity);
+    activitiesBySection.set(sectionId, sectionActivities);
+  }
+
+  return asArray(state.section).map((item) => {
+    const data = asRecord(item);
+    const id = numberValue(data.id);
+    const hasActivityList = Array.isArray(data.cmlist);
+    const listedActivities = asArray(data.cmlist)
+      .map((activityId) => activities.get(stringValue(activityId)))
+      .filter((activity): activity is Activity => activity !== undefined);
+    // Core names the parent of a delegated subsection parentsectionid; nesting formats
+    // that predate it use parentid.
+    const parent = numberValue(data.parentsectionid ?? data.parentid);
+    return {
+      id,
+      name: htmlText(data.title || data.rawtitle, baseUrl),
+      section: numberValue(data.section ?? data.number),
+      visible: booleanValue(data.visible, true),
+      summary: htmlText(data.summary, baseUrl),
+      ...(data.current !== undefined ? { current: booleanValue(data.current) } : {}),
+      ...(parent ? { parent } : {}),
+      activities: hasActivityList ? listedActivities : activitiesBySection.get(String(id)) ?? [],
+    };
+  });
 }
 
 export function flattenActivities(sections: Section[]): Activity[] {
@@ -167,95 +217,6 @@ export function parseAlertSummary(
     unread_direct_message_count: numberValue(unreadTypes["1"]),
     unread_group_message_count: numberValue(unreadTypes["2"]),
     unread_self_message_count: numberValue(unreadTypes["3"]),
-  };
-}
-
-export function parseCalendarEvent(value: unknown): CalendarEvent {
-  const data = asRecord(value);
-  const course = asRecord(data.course);
-  const start = numberValue(data.timestart);
-  const duration = numberValue(data.timeduration);
-  return {
-    id: numberValue(data.id),
-    name: stringValue(data.name),
-    description: htmlToStructuredContent(stringValue(data.description), "").text,
-    course_id: numberValue(course.id),
-    course_name: stringValue(course.fullname),
-    modname: stringValue(data.modulename),
-    event_type: stringValue(data.eventtype),
-    starts_at: start,
-    ends_at: duration > 0 ? start + duration : start,
-    location: stringValue(data.location),
-    url: stringValue(data.url) || stringValue(data.viewurl),
-  };
-}
-
-export function parseCalendarEvents(value: unknown): CalendarEvent[] {
-  return asArray(value).map((item) => parseCalendarEvent(item));
-}
-
-export function parseGradeOverviewGrades(value: unknown, courseNames: Map<number, string>, baseUrl: string): GradeOverviewRow[] {
-  const data = asRecord(value);
-  return asArray(data.grades)
-    .map((item) => {
-      const grade = asRecord(item);
-      const courseId = numberValue(grade.courseid);
-      return {
-        course_id: courseId,
-        course_name: courseNames.get(courseId) ?? "",
-        grade: stringValue(grade.grade),
-        url: courseId ? `${baseUrl.replace(/\/$/, "")}/course/user.php?mode=grade&id=${courseId}` : "",
-      };
-    })
-    .filter((row) => row.course_id > 0);
-}
-
-const CONVERSATION_TYPES: Record<number, string> = { 1: "direct", 2: "group", 3: "self" };
-
-export function parseConversations(value: unknown, currentUserId: number, baseUrl: string): Conversation[] {
-  const data = asRecord(value);
-  return asArray(data.conversations).map((item) => {
-    const conversation = asRecord(item);
-    const members = asArray(conversation.members).map((member) => asRecord(member));
-    const others = members.filter((member) => numberValue(member.id) !== currentUserId);
-    const lastMessage = asRecord(asArray(conversation.messages)[0]);
-    const senderId = numberValue(lastMessage.useridfrom);
-    return {
-      id: numberValue(conversation.id),
-      name: stringValue(conversation.name) || others.map((member) => stringValue(member.fullname)).filter(Boolean).join(", "),
-      type: CONVERSATION_TYPES[numberValue(conversation.type)] ?? String(conversation.type ?? ""),
-      member_count: numberValue(conversation.membercount),
-      unread_count: numberValue(conversation.unreadcount),
-      is_favourite: booleanValue(conversation.isfavourite),
-      last_message: htmlToStructuredContent(stringValue(lastMessage.text), baseUrl).text,
-      last_message_at: numberValue(lastMessage.timecreated),
-      last_sender: senderId === currentUserId ? "me" : stringValue(members.find((member) => numberValue(member.id) === senderId)?.fullname),
-    };
-  });
-}
-
-export function parseConversationDetail(value: unknown, conversationId: number, currentUserId: number, baseUrl: string): ConversationDetail {
-  const data = asRecord(value);
-  const members = asArray(data.members).map((member) => asRecord(member));
-  const names = new Map(members.map((member) => [numberValue(member.id), stringValue(member.fullname)]));
-  const messages: ConversationMessage[] = asArray(data.messages)
-    .map((item) => {
-      const message = asRecord(item);
-      const senderId = numberValue(message.useridfrom);
-      return {
-        id: numberValue(message.id),
-        sender_id: senderId,
-        sender_name: senderId === currentUserId ? "me" : names.get(senderId) ?? "",
-        text: htmlToStructuredContent(stringValue(message.text), baseUrl).text,
-        sent_at: numberValue(message.timecreated),
-      };
-    })
-    .sort((a, b) => a.sent_at - b.sent_at);
-  return {
-    id: numberValue(data.id) || conversationId,
-    name: stringValue(data.name) || members.filter((member) => numberValue(member.id) !== currentUserId).map((member) => stringValue(member.fullname)).filter(Boolean).join(", "),
-    member_count: members.length,
-    messages,
   };
 }
 
@@ -339,4 +300,17 @@ export function booleanValue(value: unknown, defaultValue = false): boolean {
     return defaultValue;
   }
   return Boolean(value);
+}
+
+function parseJsonValue(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return {};
+  }
+}
+
+function htmlText(value: unknown, baseUrl: string): string {
+  return htmlToStructuredContent(stringValue(value), baseUrl).text;
 }

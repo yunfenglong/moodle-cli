@@ -5,6 +5,7 @@ export interface UserInfo {
   sitename: string;
   siteurl: string;
   lang?: string;
+  timezone?: string;
 }
 
 export interface PageContext {
@@ -29,6 +30,8 @@ export interface Activity {
   url: string;
   visible: boolean;
   description: string;
+  completion?: number;
+  file_entries?: FileEntry[];
 }
 
 export interface Section {
@@ -37,6 +40,9 @@ export interface Section {
   section: number;
   visible: boolean;
   summary: string;
+  current?: boolean;
+  // The section this one is nested in, when the site's format says.
+  parent?: number;
   activities: Activity[];
 }
 
@@ -115,148 +121,6 @@ export interface CourseGrades {
   items: GradeItem[];
 }
 
-export interface GradeOverviewRow {
-  course_id: number;
-  course_name: string;
-  grade: string;
-  url: string;
-}
-
-export interface Conversation {
-  id: number;
-  name: string;
-  type: string;
-  member_count: number;
-  unread_count: number;
-  is_favourite: boolean;
-  last_message: string;
-  last_message_at: number;
-  last_sender: string;
-}
-
-export interface ConversationMessage {
-  id: number;
-  sender_id: number;
-  sender_name: string;
-  text: string;
-  sent_at: number;
-}
-
-export interface ConversationDetail {
-  id: number;
-  name: string;
-  member_count: number;
-  messages: ConversationMessage[];
-}
-
-export interface CalendarEvent {
-  id: number;
-  name: string;
-  description: string;
-  course_id: number;
-  course_name: string;
-  modname: string;
-  event_type: string;
-  starts_at: number;
-  ends_at: number;
-  location: string;
-  url: string;
-}
-
-export interface CourseSearchHit {
-  course_id: number;
-  course_name: string;
-  section_name: string;
-  activity_id: number;
-  activity_name: string;
-  modname: string;
-  matched_in: string;
-  snippet: string;
-  url: string;
-}
-
-export interface CourseExportSummary {
-  course_id: number;
-  course_name: string;
-  dir: string;
-  sections: number;
-  pages: number;
-  links: number;
-  files: DownloadResult[];
-}
-
-export interface AssignSubmitResult {
-  assign_id: number;
-  uploaded: Array<{ file: string; bytes: number }>;
-  saved: boolean;
-  submitted_for_grading: boolean;
-  submission_status: string;
-  submission_statement: string;
-}
-
-export interface ChoiceOption {
-  id: number;
-  text: string;
-  selected: boolean;
-}
-
-export interface ChoiceInfo {
-  id: number;
-  name: string;
-  can_vote: boolean;
-  multiple: boolean;
-  options: ChoiceOption[];
-  url: string;
-}
-
-export interface FeedbackQuestion {
-  item_id: number;
-  name: string;
-  label: string;
-  type: string;
-  required: boolean;
-  options: Array<{ value: string; text: string }>;
-}
-
-export interface FeedbackInfo {
-  id: number;
-  name: string;
-  page: number;
-  has_more_pages: boolean;
-  questions: FeedbackQuestion[];
-  url: string;
-}
-
-export interface FeedbackSubmitResult {
-  id: number;
-  completed: boolean;
-  pages_submitted: number;
-  message: string;
-}
-
-export interface CompletionResult {
-  cmid: number;
-  completed: boolean;
-  updated: boolean;
-}
-
-export interface DownloadItem {
-  name: string;
-  url: string;
-  source: string;
-  relative_path?: string;
-  content?: string;
-}
-
-export interface DownloadResult {
-  name: string;
-  file: string;
-  url: string;
-  bytes: number;
-  status: "downloaded" | "exists" | "planned" | "failed";
-  error?: string;
-}
-
 export interface Assignment {
   id: number;
   name: string;
@@ -268,8 +132,20 @@ export interface Assignment {
   grading_status: string;
   time_remaining: string;
   grade: string;
-  submission_files: string[];
+  graded_on: string;
+  graded_by: string;
+  feedback_comments: string;
+  criteria: FeedbackCriterion[];
+  file_entries: FileEntry[];
   url: string;
+}
+
+/** One row of a rubric or marking guide as the marker filled it in. */
+export interface FeedbackCriterion {
+  name: string;
+  level: string;
+  score: string;
+  remark: string;
 }
 
 export interface Quiz {
@@ -281,9 +157,55 @@ export interface Quiz {
   opens_pretty: string;
   closes_pretty: string;
   attempts_allowed: string;
+  time_limit: string;
   availability: string;
   grade: string;
+  attempts: QuizAttempt[];
   url: string;
+}
+
+/** One card under "Your attempts" on a quiz page; marks and grade show only when the site permits review. */
+export interface QuizAttempt {
+  id: number;
+  number: number;
+  status: string;
+  started: string;
+  completed: string;
+  duration: string;
+  marks: string;
+  grade: string;
+  review_url: string;
+}
+
+export interface QuizQuestion {
+  number: number;
+  type: string;
+  state: string;
+  mark: string;
+  text: string;
+  response: string;
+  correct: string;
+  feedback: string;
+}
+
+export interface QuizAttemptReview {
+  id: number;
+  quiz_id: number;
+  course_id: number;
+  status: string;
+  started: string;
+  completed: string;
+  duration: string;
+  marks: string;
+  grade: string;
+  questions: QuizQuestion[];
+  url: string;
+}
+
+export interface FileEntry {
+  name: string;
+  url: string;
+  requires_authentication: boolean;
 }
 
 export interface Resource {
@@ -294,6 +216,7 @@ export interface Resource {
   section_name: string;
   target_name: string;
   target_url: string;
+  file_entries: FileEntry[];
   url: string;
 }
 
@@ -314,11 +237,6 @@ export interface Page {
   course_name: string;
   section_name: string;
   content_text: string;
-  content_html: string;
-  image_urls: string[];
-  links: Array<{ text: string; url: string }>;
-  tables: Array<{ headers: string[]; rows: string[][] }>;
-  files: Array<{ name: string; url: string }>;
   url: string;
 }
 
@@ -329,10 +247,11 @@ export interface Folder {
   course_name: string;
   section_name: string;
   files: string[];
+  file_entries: FileEntry[];
   url: string;
 }
 
-export type ActivityDetail = Assignment | Quiz | Resource | Link | Page | Folder;
+export type ActivityDetail = Assignment | Quiz | Resource | Link | Page | Folder | Activity;
 
 export interface ForumPostAuthor {
   id: number;
